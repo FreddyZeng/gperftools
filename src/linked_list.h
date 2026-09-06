@@ -41,32 +41,28 @@
 
 namespace tcmalloc {
 
-inline void *SLL_Next(void *t) {
-  return *(reinterpret_cast<void**>(t));
-}
+inline void* SLL_Next(void* t) { return *(reinterpret_cast<void**>(t)); }
 
-inline void SLL_SetNext(void *t, void *n) {
-  *(reinterpret_cast<void**>(t)) = n;
-}
+inline void SLL_SetNext(void* t, void* n) { *(reinterpret_cast<void**>(t)) = n; }
 
-inline void SLL_Push(void **list, void *element) {
-  void *next = *list;
+inline void SLL_Push(void** list, void* element) {
+  void* next = *list;
   *list = element;
   SLL_SetNext(element, next);
 }
 
-inline void *SLL_Pop(void **list) {
-  void *result = *list;
+inline void* SLL_Pop(void** list) {
+  void* result = *list;
   *list = SLL_Next(*list);
   return result;
 }
 
-inline bool SLL_TryPop(void **list, void **rv) {
-  void *result = *list;
+inline bool SLL_TryPop(void** list, void** rv) {
+  void* result = *list;
   if (!result) {
     return false;
   }
-  void *next = SLL_Next(*list);
+  void* next = SLL_Next(*list);
   *list = next;
   *rv = result;
   return true;
@@ -74,16 +70,16 @@ inline bool SLL_TryPop(void **list, void **rv) {
 
 // Remove N elements from a linked list to which head points.  head will be
 // modified to point to the new head.  start and end will point to the first
-// and last nodes of the range.  Note that end will point to NULL after this
+// and last nodes of the range.  Note that end will point to nullptr after this
 // function is called.
-inline void SLL_PopRange(void **head, int N, void **start, void **end) {
+inline void SLL_PopRange(void** head, int N, void** start, void** end) {
   if (N == 0) {
-    *start = NULL;
-    *end = NULL;
+    *start = nullptr;
+    *end = nullptr;
     return;
   }
 
-  void *tmp = *head;
+  void* tmp = *head;
   for (int i = 1; i < N; ++i) {
     tmp = SLL_Next(tmp);
   }
@@ -92,16 +88,16 @@ inline void SLL_PopRange(void **head, int N, void **start, void **end) {
   *end = tmp;
   *head = SLL_Next(tmp);
   // Unlink range from list.
-  SLL_SetNext(tmp, NULL);
+  SLL_SetNext(tmp, nullptr);
 }
 
-inline void SLL_PushRange(void **head, void *start, void *end) {
+inline void SLL_PushRange(void** head, void* start, void* end) {
   if (!start) return;
   SLL_SetNext(end, *head);
   *head = start;
 }
 
-inline size_t SLL_Size(void *head) {
+inline size_t SLL_Size(void* head) {
   int count = 0;
   while (head) {
     count++;

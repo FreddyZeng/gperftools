@@ -45,20 +45,28 @@ TEST(LargeHeapFragmentationTest, Basic) {
   // a big chunk of consecutive memory. Otherwise details of
   // sys-allocator behavior may trigger fragmentation regardless of
   // our mitigations.
-  tc_free(tc_malloc(550 << 20));
+#ifndef _WIN32
+  static constexpr size_t kInitialAmt = 550 << 20;
+#else
+  // FIXME: on windows it is quite painful due to syscalls that we do
+  // when returning memory to kernel whenever returned span touches
+  // more than one memory "reservation" area. So for now, lets reduce
+  // pain. And in the future lets make windows case fast.
+  static constexpr size_t kInitialAmt = 1000 << 20;
+#endif
+
+  tc_free(tc_malloc(kInitialAmt));
   MallocExtension::instance()->ReleaseFreeMemory();
 
   for (int pass = 1; pass <= 3; pass++) {
-    size_t size = 100*1024*1024;
-    while (size < 500*1024*1024) {
-      void *ptr = tc_malloc(size);
+    size_t size = 100 * 1024 * 1024;
+    while (size < 500 * 1024 * 1024) {
+      void* ptr = tc_malloc(size);
       free(ptr);
       size += 20000;
 
       size_t heap_size = static_cast<size_t>(-1);
-      ASSERT_TRUE(MallocExtension::instance()->GetNumericProperty(
-                    "generic.heap_size",
-                    &heap_size));
+      ASSERT_TRUE(MallocExtension::instance()->GetNumericProperty("generic.heap_size", &heap_size));
 
       ASSERT_LT(heap_size, 1 << 30);
     }

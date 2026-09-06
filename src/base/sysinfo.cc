@@ -30,45 +30,32 @@
 
 #include <config.h>
 #if (defined(_WIN32) || defined(__MINGW32__)) && !defined(__CYGWIN__) && !defined(__CYGWIN32)
-# define PLATFORM_WINDOWS 1
+#define PLATFORM_WINDOWS 1
 #endif
 
-#include "base/sysinfo.h"
 #include "base/commandlineflags.h"
-#include "base/dynamic_annotations.h"   // for RunningOnValgrind
+#include "base/environ.h"
 #include "base/logging.h"
+#include "base/memmap.h"
+#include "base/sysinfo.h"
 
 #include <tuple>
 
-#include <ctype.h>    // for isspace()
-#include <stdlib.h>   // for getenv()
-#include <stdio.h>    // for snprintf(), sscanf()
-#include <string.h>   // for memmove(), memchr(), etc.
-#include <fcntl.h>    // for open()
-#include <errno.h>    // for errno
+#include <stdlib.h>  // for getenv()
+#include <stdio.h>   // for snprintf(), sscanf()
+#include <string.h>  // for memmove(), memchr(), etc.
+#include <fcntl.h>   // for open()
 #ifdef HAVE_UNISTD_H
-#include <unistd.h>   // for read()
+#include <limits.h>  // for PATH_MAX
+#include <unistd.h>  // for read()
 #endif
 
-// open/read/close can set errno, which may be illegal at this
-// time, so prefer making the syscalls directly if we can.
-#if HAVE_SYS_SYSCALL_H
-# include <sys/syscall.h>
+#if defined(__FreeBSD__)
+#include <sys/sysctl.h>
 #endif
-#ifdef SYS_open   // solaris 11, at least sometimes, only defines SYS_openat
-# define safeopen(filename, mode)  syscall(SYS_open, filename, mode)
-#else
-# define safeopen(filename, mode)  open(filename, mode)
-#endif
-#ifdef SYS_read
-# define saferead(fd, buffer, size)  syscall(SYS_read, fd, buffer, size)
-#else
-# define saferead(fd, buffer, size)  read(fd, buffer, size)
-#endif
-#ifdef SYS_close
-# define safeclose(fd)  syscall(SYS_close, fd)
-#else
-# define safeclose(fd)  close(fd)
+
+#ifdef __MACH__
+#include <mach-o/dyld.h>  // for GetProgramInvocationName()
 #endif
 
 // ----------------------------------------------------------------------
@@ -77,89 +64,11 @@
 //    Some non-trivial getenv-related functions.
 // ----------------------------------------------------------------------
 
-// we reimplement memcmp and friends to avoid depending on any glibc
-// calls too early in the process lifetime. This allows us to use
-// GetenvBeforeMain from inside ifunc handler
-ATTRIBUTE_UNUSED
-static int slow_memcmp(const void *_a, const void *_b, size_t n) {
-  const uint8_t *a = reinterpret_cast<const uint8_t *>(_a);
-  const uint8_t *b = reinterpret_cast<const uint8_t *>(_b);
-  while (n-- != 0) {
-    uint8_t ac = *a++;
-    uint8_t bc = *b++;
-    if (ac != bc) {
-      if (ac < bc) {
-        return -1;
-      }
-      return 1;
-    }
-  }
-  return 0;
-}
-
-static const char *slow_memchr(const char *s, int c, size_t n) {
-  uint8_t ch = static_cast<uint8_t>(c);
-  while (n--) {
-    if (*s++ == ch) {
-      return s - 1;
-    }
-  }
-  return 0;
-}
-
-static size_t slow_strlen(const char *s) {
-  const char *s2 = slow_memchr(s, '\0', static_cast<size_t>(-1));
-  return s2 - s;
-}
-
-// It's not safe to call getenv() in the malloc hooks, because they
-// might be called extremely early, before libc is done setting up
-// correctly.  In particular, the thread library may not be done
-// setting up errno.  So instead, we use the built-in __environ array
-// if it exists, and otherwise read /proc/self/environ directly, using
-// system calls to read the file, and thus avoid setting errno.
-// /proc/self/environ has a limit of how much data it exports (around
-// 8K), so it's not an ideal solution.
+// NOTE, we used to have very special code for accessing environment
+// (potentially) early, but in practice it is safe to access even very
+// early (with notable exception of windows, as usual).
 #ifndef PLATFORM_WINDOWS
-const char* GetenvBeforeMain(const char* name) {
-  const int namelen = slow_strlen(name);
-#if defined(HAVE___ENVIRON)   // if we have it, it's declared in unistd.h
-  if (__environ) {            // can exist but be NULL, if statically linked
-    for (char** p = __environ; *p; p++) {
-      if (!slow_memcmp(*p, name, namelen) && (*p)[namelen] == '=')
-        return *p + namelen+1;
-    }
-    return NULL;
-  }
-#endif
-  // static is ok because this function should only be called before
-  // main(), when we're single-threaded.
-  static char envbuf[16<<10];
-  if (*envbuf == '\0') {    // haven't read the environ yet
-    int fd = safeopen("/proc/self/environ", O_RDONLY);
-    // The -2 below guarantees the last two bytes of the buffer will be \0\0
-    if (fd == -1 ||           // unable to open the file, fall back onto libc
-        saferead(fd, envbuf, sizeof(envbuf) - 2) < 0) { // error reading file
-      RAW_VLOG(1, "Unable to open /proc/self/environ, falling back "
-               "on getenv(\"%s\"), which may not work", name);
-      if (fd != -1) safeclose(fd);
-      return getenv(name);
-    }
-    safeclose(fd);
-  }
-  const char* p = envbuf;
-  while (*p != '\0') {    // will happen at the \0\0 that terminates the buffer
-    // proc file has the format NAME=value\0NAME=value\0NAME=value\0...
-    const char* endp = (char*)slow_memchr(p, '\0',
-                                          sizeof(envbuf) - (p - envbuf));
-    if (endp == NULL)            // this entry isn't NUL terminated
-      return NULL;
-    else if (!slow_memcmp(p, name, namelen) && p[namelen] == '=')    // it's a match
-      return p + namelen+1;      // point after =
-    p = endp + 1;
-  }
-  return NULL;                   // env var never found
-}
+const char* GetenvBeforeMain(const char* name) { return getenv(name); }
 #else  // PLATFORM_WINDOWS
 
 // One windows we could use C runtime environment access or more
@@ -175,7 +84,7 @@ const char* GetenvBeforeMain(const char* name) {
 // this function "break" values returned from previous calls. We're
 // fine with that too.
 const char* GetenvBeforeMain(const char* name) {
-  const int namelen = slow_strlen(name);
+  const int namelen = strlen(name);
 
   static constexpr int kBufSize = 1024;
   // This is the buffer we'll return from here. So it is static. See
@@ -201,10 +110,10 @@ const char* GetenvBeforeMain(const char* name) {
   if (!(used_buf = GetEnvironmentVariableW(wname, wide_envvar_buf, kBufSize))) {
     return nullptr;
   }
-  used_buf++; // include terminating \0 character.
+  used_buf++;  // include terminating \0 character.
 
   // Then we convert variable value, if any, to 7-bit ascii.
-  for (size_t i = 0; i < used_buf ; i++) {
+  for (size_t i = 0; i < used_buf; i++) {
     auto wch = wide_envvar_buf[i];
     if ((wch >> 7)) {
       // If we see any non-ascii char, we silently assume no env
@@ -220,9 +129,7 @@ const char* GetenvBeforeMain(const char* name) {
 #endif  // !PLATFORM_WINDOWS
 
 extern "C" {
-  const char* TCMallocGetenvSafe(const char* name) {
-    return GetenvBeforeMain(name);
-  }
+const char* TCMallocGetenvSafe(const char* name) { return GetenvBeforeMain(name); }
 }
 
 // HPC environment auto-detection
@@ -238,7 +145,7 @@ extern "C" {
 // GetUniquePathFromEnv value. Second and third return values are
 // strings to be appended to path for extra identification.
 static std::tuple<bool, const char*, const char*> QueryHPCEnvironment() {
-  auto mk = [] (bool a, const char* b, const char* c) {
+  auto mk = [](bool a, const char* b, const char* c) {
     // We have to work around gcc 5 bug in tuple constructor. It
     // doesn't let us do {a, b, c}
     //
@@ -302,19 +209,16 @@ int GetPID() {
 //
 // If we're a child process of the 'main' process, we can't just use
 // getenv("CPUPROFILE") -- the parent process will be using that path.
-// Instead we append our pid to the pathname.  How do we tell if we're a
-// child process?  Ideally we'd set an environment variable that all
-// our children would inherit.  But -- and this is seemingly a bug in
-// gcc -- if you do a setenv() in a shared libarary in a global
-// constructor, the environment setting is lost by the time main() is
-// called.  The only safe thing we can do in such a situation is to
-// modify the existing envvar.  So we do a hack: in the parent, we set
-// the high bit of the 1st char of CPUPROFILE.  In the child, we
-// notice the high bit is set and append the pid().  This works
-// assuming cpuprofile filenames don't normally have the high bit set
-// in their first character!  If that assumption is violated, we'll
-// still get a profile, but one with an unexpected name.
-// TODO(csilvers): set an envvar instead when we can do it reliably.
+// Instead we append our pid to the pathname.  How do we tell if we're
+// a child process? Ideally we'd set an environment variable that all
+// our children would inherit. We use direct environ access, because
+// {set,put}env will recurse back to malloc. While none of this is
+// strictly speaking thread-safe (setenv included), we're calling this
+// early enough where threads are usually not running. So mutating
+// environ is safe enough. I also checked several OSes, and other than
+// windows, it really is supported to manually override environ.
+//
+// We put CPUPROFILE_USE_PID=1 marker for the children.
 bool GetUniquePathFromEnv(const char* env_name, char* path) {
   char* envval = getenv(env_name);
 
@@ -332,34 +236,32 @@ bool GetUniquePathFromEnv(const char* env_name, char* path) {
   char forceVarName[256];
   snprintf(forceVarName, sizeof(forceVarName), "%s_USE_PID", env_name);
 
+#if defined(PLATFORM_WINDOWS)
+  pidIsForced = true;
+#else
   pidIsForced = pidIsForced || EnvToBool(forceVarName, false);
+  if (!pidIsForced) {
+    // As noted above, we want to arrange children of this process to
+    // append pid to their file names.
+    tcmalloc::SafeSetEnv(forceVarName, "1");
+  }
+#endif
 
-  // Get information about the child bit and drop it
-  const bool childBitDetected = (*envval & 128) != 0;
-  *envval &= ~128;
-
-  if (pidIsForced || childBitDetected) {
-    snprintf(path, PATH_MAX, "%s%s%s_%d",
-             envval, append1, append2, GetPID());
+  if (pidIsForced) {
+    snprintf(path, PATH_MAX, "%s%s%s_%d", envval, append1, append2, GetPID());
   } else {
     snprintf(path, PATH_MAX, "%s%s%s", envval, append1, append2);
   }
 
-  // Set the child bit for the fork'd processes, unless appending pid
-  // was forced by either _USE_PID thingy or via MPI detection stuff.
-  if (childBitDetected || !pidIsForced) {
-    *envval |= 128;
-  }
   return true;
 }
 
-int GetSystemCPUsCount()
-{
+int GetSystemCPUsCount() {
 #if defined(PLATFORM_WINDOWS)
   // Get the number of processors.
   SYSTEM_INFO info;
   GetSystemInfo(&info);
-  return  info.dwNumberOfProcessors;
+  return info.dwNumberOfProcessors;
 #else
   long rv = sysconf(_SC_NPROCESSORS_ONLN);
   if (rv < 0) {
@@ -368,3 +270,107 @@ int GetSystemCPUsCount()
   return static_cast<int>(rv);
 #endif
 }
+
+namespace {
+
+#ifndef _WIN32
+// NOTE: inline makes us avoid unused function warning
+inline const char* readlink_strdup(const char* path) {
+  int sz = 1024;
+  char* retval = nullptr;
+  for (;;) {
+    if (INT_MAX / 2 <= sz) {
+      free(retval);
+      retval = nullptr;
+      break;
+    }
+    sz *= 2;
+    retval = static_cast<char*>(realloc(retval, sz));
+    int rc = readlink(path, retval, sz);
+    if (rc < 0) {
+      perror("GetProgramInvocationName:readlink");
+      free(retval);
+      retval = nullptr;
+      break;
+    }
+    if (rc < sz) {
+      retval[rc] = 0;
+      break;
+    }
+    // repeat if readlink may have truncated it's output
+  }
+  return retval;
+}
+#endif  // _WIN32
+
+}  // namespace
+
+namespace tcmalloc {
+
+// Returns nullptr if we're on an OS where we can't get the invocation name.
+// Using a static var is ok because we're not called from a thread.
+const char* GetProgramInvocationName() {
+#if defined(__linux__) || defined(__NetBSD__)
+  // Those systems have functional procfs. And we can simply readlink
+  // /proc/self/exe.
+  static const char* argv0 = readlink_strdup("/proc/self/exe");
+  return argv0;
+#elif defined(__sun__)
+  static const char* argv0 = readlink_strdup("/proc/self/path/a.out");
+  return argv0;
+#elif defined(HAVE_PROGRAM_INVOCATION_NAME)
+  extern char* program_invocation_name;  // gcc provides this
+  return program_invocation_name;
+#elif defined(__MACH__)
+  // We don't want to allocate memory for this since we may be
+  // calculating it when memory is corrupted.
+  static char program_invocation_name[PATH_MAX];
+  if (program_invocation_name[0] == '\0') {  // first time calculating
+    uint32_t length = sizeof(program_invocation_name);
+    if (_NSGetExecutablePath(program_invocation_name, &length)) return nullptr;
+  }
+  return program_invocation_name;
+#elif defined(__FreeBSD__)
+  static char program_invocation_name[PATH_MAX];
+  size_t len = sizeof(program_invocation_name);
+  static const int name[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+  if (!sysctl(name, 4, program_invocation_name, &len, nullptr, 0)) return program_invocation_name;
+  return nullptr;
+#else
+  return nullptr;  // figure out a way to get argv[0]
+#endif
+}
+
+void SafeSetEnv(const char* name, const char* value) {
+  size_t env_size = 1;  // 1 for terminating nullptr entry
+  for (char** p = environ; *p != nullptr; p++) {
+    env_size++;
+  }
+
+  size_t name_size = strlen(name);
+  size_t value_size = strlen(value);
+  size_t namevalue_size = name_size + value_size + 2;  // +2 is for '=' and '\0'
+  size_t new_env_size_bytes = (env_size + 1) * sizeof(char*);
+  MMapResult mres = tcmalloc::MapAnonymous(new_env_size_bytes + namevalue_size);
+  CHECK(mres.success);
+  char* added_pair = static_cast<char*>(mres.addr) + new_env_size_bytes;
+  {
+    // copy name and value bytes
+    char* p = added_pair;
+    memcpy(p, name, name_size);
+    p += name_size;
+    *p++ = '=';
+    memcpy(p, value, value_size);
+    p += value_size;
+    *p++ = '\0';
+    CHECK(p - added_pair == namevalue_size);
+  }
+
+  char** new_env = static_cast<char**>(mres.addr);
+  new_env[0] = added_pair;
+  memcpy(new_env + 1, environ, env_size * sizeof(char*));
+
+  environ = new_env;
+}
+
+}  // namespace tcmalloc

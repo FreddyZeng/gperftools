@@ -38,7 +38,10 @@
 #define TCMALLOC_SYSTEM_ALLOC_H_
 
 #include <config.h>
-#include <stddef.h>                     // for size_t
+#include <stddef.h>  // for size_t
+
+#include "base/basictypes.h"
+#include "base/spinlock.h"
 
 class SysAllocator;
 
@@ -46,8 +49,8 @@ class SysAllocator;
 //
 // Allocate and return "N" bytes of zeroed memory.
 //
-// If actual_bytes is NULL then the returned memory is exactly the
-// requested size.  If actual bytes is non-NULL then the allocator
+// If actual_bytes is nullptr then the returned memory is exactly the
+// requested size.  If actual bytes is non-nullptr then the allocator
 // may optionally return more bytes than asked for (i.e. return an
 // entire "huge" page if a huge page allocator is in use).
 //
@@ -57,10 +60,8 @@ class SysAllocator;
 // CACHELINE_ALIGNED, the return pointer will always be cacheline
 // aligned.
 //
-// Returns NULL when out of memory.
-extern PERFTOOLS_DLL_DECL
-void* TCMalloc_SystemAlloc(size_t bytes, size_t *actual_bytes,
-			   size_t alignment = 0);
+// Returns nullptr when out of memory.
+extern PERFTOOLS_DLL_DECL void* TCMalloc_SystemAlloc(size_t bytes, size_t* actual_bytes, size_t alignment = 0);
 
 // This call is a hint to the operating system that the pages
 // contained in the specified range of memory will not be used for a
@@ -73,20 +74,21 @@ void* TCMalloc_SystemAlloc(size_t bytes, size_t *actual_bytes,
 // be released, partial pages will not.)
 //
 // Returns false if release failed or not supported.
-extern PERFTOOLS_DLL_DECL
-bool TCMalloc_SystemRelease(void* start, size_t length);
+extern PERFTOOLS_DLL_DECL bool TCMalloc_SystemRelease(void* start, size_t length);
 
 // Called to ressurect memory which has been previously released
 // to the system via TCMalloc_SystemRelease.  An attempt to
 // commit a page that is already committed does not cause this
 // function to fail.
-extern PERFTOOLS_DLL_DECL
-void TCMalloc_SystemCommit(void* start, size_t length);
+extern PERFTOOLS_DLL_DECL void TCMalloc_SystemCommit(void* start, size_t length);
 
 // The current system allocator.
 extern PERFTOOLS_DLL_DECL SysAllocator* tcmalloc_sys_alloc;
 
 // Number of bytes taken from system.
 extern PERFTOOLS_DLL_DECL size_t TCMalloc_SystemTaken;
+
+ATTRIBUTE_VISIBILITY_HIDDEN
+SpinLock* GetSysAllocLock();
 
 #endif /* TCMALLOC_SYSTEM_ALLOC_H_ */

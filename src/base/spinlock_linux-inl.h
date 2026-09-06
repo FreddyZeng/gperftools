@@ -55,9 +55,8 @@ static struct InitModule {
     int x = 0;
     // futexes are ints, so we can use them only when
     // that's the same size as the lockword_ in SpinLock.
-    have_futex = (syscall(__NR_futex, &x, FUTEX_WAKE, 1, NULL, NULL, 0) >= 0);
-    if (have_futex && syscall(__NR_futex, &x, FUTEX_WAKE | futex_private_flag,
-                              1, NULL, NULL, 0) < 0) {
+    have_futex = (syscall(__NR_futex, &x, FUTEX_WAKE, 1, nullptr, nullptr, 0) >= 0);
+    if (have_futex && syscall(__NR_futex, &x, FUTEX_WAKE | futex_private_flag, 1, nullptr, nullptr, 0) < 0) {
       futex_private_flag = 0;
     }
   }
@@ -65,11 +64,10 @@ static struct InitModule {
 
 }  // anonymous namespace
 
-
 namespace base {
 namespace internal {
 
-void SpinLockDelay(std::atomic<int> *w, int32_t value, int loop) {
+void SpinLockDelay(std::atomic<int>* w, int32_t value, int loop) {
   if (loop != 0) {
     int save_errno = errno;
     struct timespec tm;
@@ -77,26 +75,25 @@ void SpinLockDelay(std::atomic<int> *w, int32_t value, int loop) {
     if (have_futex) {
       tm.tv_nsec = base::internal::SuggestedDelayNS(loop);
     } else {
-      tm.tv_nsec = 2000001;   // above 2ms so linux 2.4 doesn't spin
+      tm.tv_nsec = 2000001;  // above 2ms so linux 2.4 doesn't spin
     }
     if (have_futex) {
       tm.tv_nsec *= 16;  // increase the delay; we expect explicit wakeups
-      syscall(__NR_futex, reinterpret_cast<int*>(w),
-              FUTEX_WAIT | futex_private_flag, value,
-              reinterpret_cast<struct kernel_timespec*>(&tm), NULL, 0);
+      syscall(__NR_futex, reinterpret_cast<int*>(w), FUTEX_WAIT | futex_private_flag, value,
+              reinterpret_cast<struct kernel_timespec*>(&tm), nullptr, 0);
     } else {
-      nanosleep(&tm, NULL);
+      nanosleep(&tm, nullptr);
     }
     errno = save_errno;
   }
 }
 
-void SpinLockWake(std::atomic<int> *w, bool all) {
+void SpinLockWake(std::atomic<int>* w, bool all) {
   if (have_futex) {
-    syscall(__NR_futex, reinterpret_cast<int*>(w),
-            FUTEX_WAKE | futex_private_flag, all ? INT_MAX : 1, NULL, NULL, 0);
+    syscall(__NR_futex, reinterpret_cast<int*>(w), FUTEX_WAKE | futex_private_flag, all ? INT_MAX : 1, nullptr, nullptr,
+            0);
   }
 }
 
-} // namespace internal
-} // namespace base
+}  // namespace internal
+}  // namespace base

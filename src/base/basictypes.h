@@ -32,8 +32,8 @@
 #define _BASICTYPES_H_
 
 #include <config.h>
-#include <string.h>       // for memcpy()
-#include <inttypes.h>     // gets us PRId64, etc
+#include <string.h>    // for memcpy()
+#include <inttypes.h>  // gets us PRId64, etc
 
 #include <stdint.h>
 #include <sys/types.h>
@@ -71,30 +71,29 @@
 
 // A macro to disallow the evil copy constructor and operator= functions
 // This should be used in the private: declarations for a class
-#define DISALLOW_EVIL_CONSTRUCTORS(TypeName)    \
-  TypeName(const TypeName&);                    \
+#define DISALLOW_EVIL_CONSTRUCTORS(TypeName) \
+  TypeName(const TypeName&);                 \
   void operator=(const TypeName&)
 
 // An alternate name that leaves out the moral judgment... :-)
 #define DISALLOW_COPY_AND_ASSIGN(TypeName) DISALLOW_EVIL_CONSTRUCTORS(TypeName)
 
 #ifdef HAVE___ATTRIBUTE__
-# define ATTRIBUTE_UNUSED __attribute__((unused))
+#define ATTRIBUTE_UNUSED __attribute__((unused))
 #else
-# define ATTRIBUTE_UNUSED
+#define ATTRIBUTE_UNUSED
 #endif
 
 #if defined(HAVE___ATTRIBUTE__)
-#define ATTR_INITIAL_EXEC __attribute__ ((tls_model ("initial-exec")))
+#define ATTR_INITIAL_EXEC __attribute__((tls_model("initial-exec")))
 #else
 #define ATTR_INITIAL_EXEC
 #endif
 
-#define arraysize(a)  (sizeof(a) / sizeof(*(a)))
+#define arraysize(a) (sizeof(a) / sizeof(*(a)))
 
-#define OFFSETOF_MEMBER(strct, field)                                   \
-   (reinterpret_cast<char*>(&reinterpret_cast<strct*>(16)->field) -     \
-    reinterpret_cast<char*>(16))
+#define OFFSETOF_MEMBER(strct, field) \
+  (reinterpret_cast<char*>(&reinterpret_cast<strct*>(16)->field) - reinterpret_cast<char*>(16))
 
 // bit_cast<Dest,Source> implements the equivalent of
 // "*reinterpret_cast<Dest*>(&source)".
@@ -123,17 +122,17 @@ inline Dest bit_cast(const Source& source) {
 //
 // This prevents undefined behavior when the dest pointer is unaligned.
 template <class Dest, class Source>
-inline void bit_store(Dest *dest, const Source *source) {
+inline void bit_store(Dest* dest, const Source* source) {
   static_assert(sizeof(Dest) == sizeof(Source), "bitcasting unequal sizes");
   memcpy(dest, source, sizeof(Dest));
 }
 
 #ifdef HAVE___ATTRIBUTE__
-# define ATTRIBUTE_WEAK      __attribute__((weak))
-# define ATTRIBUTE_NOINLINE  __attribute__((noinline))
+#define ATTRIBUTE_WEAK __attribute__((weak))
+#define ATTRIBUTE_NOINLINE __attribute__((noinline))
 #else
-# define ATTRIBUTE_WEAK
-# define ATTRIBUTE_NOINLINE
+#define ATTRIBUTE_WEAK
+#define ATTRIBUTE_NOINLINE
 #endif
 
 #ifdef _MSC_VER
@@ -141,106 +140,55 @@ inline void bit_store(Dest *dest, const Source *source) {
 #define ATTRIBUTE_NOINLINE __declspec(noinline)
 #endif
 
-#if defined(HAVE___ATTRIBUTE__) && defined(__ELF__)
-# define ATTRIBUTE_VISIBILITY_HIDDEN __attribute__((visibility("hidden")))
+#if defined(HAVE___ATTRIBUTE__) && defined(__ELF__) && !defined(TCMALLOC_DISABLE_HIDDEN_VISIBILITY)
+#define ATTRIBUTE_VISIBILITY_HIDDEN __attribute__((visibility("hidden")))
 #else
-# define ATTRIBUTE_VISIBILITY_HIDDEN
+#define ATTRIBUTE_VISIBILITY_HIDDEN
 #endif
 
-// Section attributes are supported for both ELF and Mach-O, but in
-// very different ways.  Here's the API we provide:
-// 1) ATTRIBUTE_SECTION: put this with the declaration of all functions
-//    you want to be in the same linker section
-// 2) DEFINE_ATTRIBUTE_SECTION_VARS: must be called once per unique
-//    name.  You want to make sure this is executed before any
-//    DECLARE_ATTRIBUTE_SECTION_VARS; the easiest way is to put them
-//    in the same .cc file.  Put this call at the global level.
-// 3) INIT_ATTRIBUTE_SECTION_VARS: you can scatter calls to this in
-//    multiple places to help ensure execution before any
-//    DECLARE_ATTRIBUTE_SECTION_VARS.  You must have at least one
-//    DEFINE, but you can have many INITs.  Put each in its own scope.
-// 4) DECLARE_ATTRIBUTE_SECTION_VARS: must be called before using
-//    ATTRIBUTE_SECTION_START or ATTRIBUTE_SECTION_STOP on a name.
-//    Put this call at the global level.
-// 5) ATTRIBUTE_SECTION_START/ATTRIBUTE_SECTION_STOP: call this to say
-//    where in memory a given section is.  All functions declared with
-//    ATTRIBUTE_SECTION are guaranteed to be between START and STOP.
-
-
-#if defined(HAVE___ATTRIBUTE__) && defined(__ELF__)
-# define ATTRIBUTE_SECTION(name) __attribute__ ((section (#name))) __attribute__((noinline))
-
-  // Weak section declaration to be used as a global declaration
-  // for ATTRIBUTE_SECTION_START|STOP(name) to compile and link
-  // even without functions with ATTRIBUTE_SECTION(name).
-# define DECLARE_ATTRIBUTE_SECTION_VARS(name) \
-    extern char __start_##name[] ATTRIBUTE_WEAK; \
-    extern char __stop_##name[] ATTRIBUTE_WEAK
-# define INIT_ATTRIBUTE_SECTION_VARS(name)     // no-op for ELF
-# define DEFINE_ATTRIBUTE_SECTION_VARS(name)   // no-op for ELF
-
-  // Return void* pointers to start/end of a section of code with functions
-  // having ATTRIBUTE_SECTION(name), or 0 if no such function exists.
-  // One must DECLARE_ATTRIBUTE_SECTION(name) for this to compile and link.
-# define ATTRIBUTE_SECTION_START(name) (reinterpret_cast<void*>(__start_##name))
-# define ATTRIBUTE_SECTION_STOP(name) (reinterpret_cast<void*>(__stop_##name))
-# define HAVE_ATTRIBUTE_SECTION_START 1
-
-#else
-
-# define ATTRIBUTE_SECTION(name)
-# define DECLARE_ATTRIBUTE_SECTION_VARS(name)
-# define INIT_ATTRIBUTE_SECTION_VARS(name)
-# define DEFINE_ATTRIBUTE_SECTION_VARS(name)
-# define ATTRIBUTE_SECTION_START(name) (reinterpret_cast<void*>(0))
-# define ATTRIBUTE_SECTION_STOP(name) (reinterpret_cast<void*>(0))
-
-#endif  // HAVE___ATTRIBUTE__ and __ELF__
-
 #if defined(HAVE___ATTRIBUTE__)
-# if (defined(__i386__) || defined(__x86_64__))
-#   define CACHELINE_ALIGNED __attribute__((aligned(64)))
-# elif (defined(__PPC__) || defined(__PPC64__) || defined(__ppc__) || defined(__ppc64__))
-#   define CACHELINE_ALIGNED __attribute__((aligned(16)))
-# elif (defined(__arm__))
-#   define CACHELINE_ALIGNED __attribute__((aligned(64)))
-    // some ARMs have shorter cache lines (ARM1176JZF-S is 32 bytes for example) but obviously 64-byte aligned implies 32-byte aligned
-# elif (defined(__mips__))
-#   define CACHELINE_ALIGNED __attribute__((aligned(128)))
-# elif (defined(__aarch64__))
-#   define CACHELINE_ALIGNED __attribute__((aligned(64)))
-    // implementation specific, Cortex-A53 and 57 should have 64 bytes
-# elif (defined(__s390__))
-#   define CACHELINE_ALIGNED __attribute__((aligned(256)))
-# elif (defined(__riscv) && __riscv_xlen == 64)
-#   define CACHELINE_ALIGNED __attribute__((aligned(64)))
-# elif defined(__loongarch64)
-#   define CACHELINE_ALIGNED __attribute__((aligned(64)))
-# else
-#   error Could not determine cache line length - unknown architecture
-# endif
+#if (defined(__i386__) || defined(__x86_64__))
+#define CACHELINE_ALIGNED __attribute__((aligned(64)))
+#elif (defined(__PPC__) || defined(__PPC64__) || defined(__ppc__) || defined(__ppc64__))
+#define CACHELINE_ALIGNED __attribute__((aligned(16)))
+#elif (defined(__arm__))
+#define CACHELINE_ALIGNED __attribute__((aligned(64)))
+// some ARMs have shorter cache lines (ARM1176JZF-S is 32 bytes for example) but obviously 64-byte aligned implies
+// 32-byte aligned
+#elif (defined(__mips__))
+#define CACHELINE_ALIGNED __attribute__((aligned(128)))
+#elif (defined(__aarch64__))
+#define CACHELINE_ALIGNED __attribute__((aligned(64)))
+// implementation specific, Cortex-A53 and 57 should have 64 bytes
+#elif (defined(__s390__))
+#define CACHELINE_ALIGNED __attribute__((aligned(256)))
+#elif (defined(__riscv) && __riscv_xlen == 64)
+#define CACHELINE_ALIGNED __attribute__((aligned(64)))
+#elif defined(__loongarch64)
+#define CACHELINE_ALIGNED __attribute__((aligned(64)))
+#elif defined(__sparcv9) || defined(__sparcv9__) || defined(__sparc_v9__)
+#define CACHELINE_ALIGNED __attribute__((aligned(64)))
+#elif defined(__alpha) || defined(__alpha__)
+#define CACHELINE_ALIGNED __attribute__((aligned(64)))
 #else
-# define CACHELINE_ALIGNED
+#error Could not determine cache line length - unknown architecture
+#endif
+#else
+#define CACHELINE_ALIGNED
 #endif  // defined(HAVE___ATTRIBUTE__)
 
 #if defined(HAVE___ATTRIBUTE__ALIGNED_FN)
-#  define CACHELINE_ALIGNED_FN CACHELINE_ALIGNED
+#define CACHELINE_ALIGNED_FN CACHELINE_ALIGNED
 #else
-#  define CACHELINE_ALIGNED_FN
+#define CACHELINE_ALIGNED_FN
 #endif
 
 // Structure for discovering alignment
 union MemoryAligner {
-  void*  p;
+  void* p;
   double d;
   size_t s;
 } CACHELINE_ALIGNED;
-
-#if defined(HAVE___ATTRIBUTE__) && defined(__ELF__)
-#define ATTRIBUTE_HIDDEN __attribute__((visibility("hidden")))
-#else
-#define ATTRIBUTE_HIDDEN
-#endif
 
 #if defined(__GNUC__)
 #define ALWAYS_INLINE inline __attribute__((always_inline))

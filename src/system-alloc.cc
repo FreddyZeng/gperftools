@@ -32,45 +32,63 @@
 // Author: Sanjay Ghemawat
 
 #include <config.h>
-#include <errno.h>                      // for EAGAIN, errno
-#include <fcntl.h>                      // for open, O_RDWR
-#include <stddef.h>                     // for size_t, NULL, ptrdiff_t
-#include <stdint.h>                     // for uintptr_t, intptr_t
+
+#if __APPLE__
+// sbrk is deprecated on OSXen and fails at runtime anyways.
+#undef HAVE_SBRK
+#endif
+
+#include "system-alloc.h"
+
+#include <errno.h>   // for EAGAIN, errno
+#include <fcntl.h>   // for open, O_RDWR
+#include <stddef.h>  // for size_t, ptrdiff_t
+#include <stdint.h>  // for uintptr_t, intptr_t
+
 #ifdef HAVE_MMAP
-#include <sys/mman.h>                   // for munmap, mmap, MADV_DONTNEED, etc
+#include <sys/mman.h>  // for munmap, MADV_DONTNEED, etc
 #endif
 #ifdef HAVE_UNISTD_H
-#include <unistd.h>                     // for sbrk, getpagesize, off_t
+#include <unistd.h>  // for sbrk, getpagesize, off_t
 #endif
-#include <new>                          // for operator new
-#include <gperftools/malloc_extension.h>
+
+#include <gperftools/malloc_extension.h>  // For SysAllocator API
+
 #include "base/basictypes.h"
 #include "base/commandlineflags.h"
-#include "base/spinlock.h"              // for SpinLockHolder, SpinLock, etc
+#include "base/memmap.h"
+#include "base/spinlock.h"
 #include "base/static_storage.h"
 #include "common.h"
 #include "internal_logging.h"
-
-// On systems (like freebsd) that don't define MAP_ANONYMOUS, use the old
-// form of the name instead.
-#ifndef MAP_ANONYMOUS
-# define MAP_ANONYMOUS MAP_ANON
-#endif
 
 // Linux added support for MADV_FREE in 4.5 but we aren't ready to use it
 // yet. Among other things, using compile-time detection leads to poor
 // results when compiling on a system with MADV_FREE and running on a
 // system without it. See https://github.com/gperftools/gperftools/issues/780.
 #if defined(__linux__) && defined(MADV_FREE) && !defined(TCMALLOC_USE_MADV_FREE)
-# undef MADV_FREE
+#undef MADV_FREE
 #endif
 
-// MADV_FREE is specifically designed for use by malloc(), but only
-// FreeBSD supports it; in linux we fall back to the somewhat inferior
-// MADV_DONTNEED.
 #if !defined(MADV_FREE) && defined(MADV_DONTNEED)
-# define MADV_FREE  MADV_DONTNEED
+#define MADV_FREE MADV_DONTNEED
 #endif
+
+// Number of bytes taken from system.
+size_t TCMalloc_SystemTaken;
+
+// The current system allocator
+SysAllocator* tcmalloc_sys_alloc;
+
+ATTRIBUTE_WEAK ATTRIBUTE_NOINLINE SysAllocator* tc_get_sysalloc_override(SysAllocator* def) { return def; }
+
+DEFINE_bool(malloc_skip_sbrk, EnvToBool("TCMALLOC_SKIP_SBRK", false), "Whether sbrk can be used to obtain memory.");
+DEFINE_bool(malloc_skip_mmap, EnvToBool("TCMALLOC_SKIP_MMAP", false), "Whether mmap can be used to obtain memory.");
+DEFINE_bool(malloc_disable_memory_release, EnvToBool("TCMALLOC_DISABLE_MEMORY_RELEASE", false),
+            "Whether MADV_FREE/MADV_DONTNEED should be used"
+            " to return unused memory to the system.");
+
+namespace {
 
 // Set kDebugMode mode so that we can have use C++ conditionals
 // instead of preprocessor conditionals.
@@ -79,10 +97,6 @@ static const bool kDebugMode = false;
 #else
 static const bool kDebugMode = true;
 #endif
-
-// TODO(sanjay): Move the code below into the tcmalloc namespace
-using tcmalloc::kLog;
-using tcmalloc::Log;
 
 // Check that no bit is set at position ADDRESS_BITS or higher.
 static bool CheckAddressBits(uintptr_t ptr) {
@@ -93,48 +107,27 @@ static bool CheckAddressBits(uintptr_t ptr) {
   return always_ok || ((ptr >> shift_bits) == 0);
 }
 
-static_assert(kAddressBits <= 8 * sizeof(void*),
-              "address bits larger than pointer size");
+static_assert(kAddressBits <= 8 * sizeof(void*), "address bits larger than pointer size");
 
 static SpinLock spinlock;
 
-#if defined(HAVE_MMAP) || defined(MADV_FREE)
-// Page size is initialized on demand (only needed for mmap-based allocators)
+// Page size is initialized on demand.
 static size_t pagesize = 0;
-#endif
-
-// The current system allocator
-SysAllocator* tcmalloc_sys_alloc = NULL;
-
-// Number of bytes taken from system.
-size_t TCMalloc_SystemTaken = 0;
-
-DEFINE_bool(malloc_skip_sbrk,
-            EnvToBool("TCMALLOC_SKIP_SBRK", false),
-            "Whether sbrk can be used to obtain memory.");
-DEFINE_bool(malloc_skip_mmap,
-            EnvToBool("TCMALLOC_SKIP_MMAP", false),
-            "Whether mmap can be used to obtain memory.");
-DEFINE_bool(malloc_disable_memory_release,
-            EnvToBool("TCMALLOC_DISABLE_MEMORY_RELEASE", false),
-            "Whether MADV_FREE/MADV_DONTNEED should be used"
-            " to return unused memory to the system.");
 
 // static allocators
 class SbrkSysAllocator : public SysAllocator {
-public:
-  SbrkSysAllocator() : SysAllocator() {
-  }
-  void* Alloc(size_t size, size_t *actual_size, size_t alignment);
+ public:
+  SbrkSysAllocator() : SysAllocator() {}
+  void* Alloc(size_t size, size_t* actual_size, size_t alignment);
 };
 static tcmalloc::StaticStorage<SbrkSysAllocator> sbrk_space;
 
 class MmapSysAllocator : public SysAllocator {
-public:
-  MmapSysAllocator() : SysAllocator() {
-  }
-  void* Alloc(size_t size, size_t *actual_size, size_t alignment);
-private:
+ public:
+  MmapSysAllocator() : SysAllocator() {}
+  void* Alloc(size_t size, size_t* actual_size, size_t alignment);
+
+ private:
   uintptr_t hint_ = 0;
 };
 static tcmalloc::StaticStorage<MmapSysAllocator> mmap_space;
@@ -144,19 +137,18 @@ class DefaultSysAllocator : public SysAllocator {
   DefaultSysAllocator() : SysAllocator() {
     for (int i = 0; i < kMaxAllocators; i++) {
       failed_[i] = true;
-      allocs_[i] = NULL;
-      names_[i] = NULL;
+      allocs_[i] = nullptr;
+      names_[i] = nullptr;
     }
   }
-  void SetChildAllocator(SysAllocator* alloc, unsigned int index,
-                         const char* name) {
-    if (index < kMaxAllocators && alloc != NULL) {
+  void SetChildAllocator(SysAllocator* alloc, unsigned int index, const char* name) {
+    if (index < kMaxAllocators && alloc != nullptr) {
       allocs_[index] = alloc;
       failed_[index] = false;
       names_[index] = name;
     }
   }
-  void* Alloc(size_t size, size_t *actual_size, size_t alignment);
+  void* Alloc(size_t size, size_t* actual_size, size_t alignment);
 
  private:
   static const int kMaxAllocators = 2;
@@ -168,22 +160,9 @@ static tcmalloc::StaticStorage<DefaultSysAllocator> default_space;
 static const char sbrk_name[] = "SbrkSysAllocator";
 static const char mmap_name[] = "MmapSysAllocator";
 
-#ifdef HAVE_SBRK
-extern "C" {
-  // When we're building "full" tcmalloc with mmap_hook.cc linked-in,
-  // this definition gets overriden by definition in mmap_hook.cc
-  // which handles hooks which is required by heap checker.
-  ATTRIBUTE_VISIBILITY_HIDDEN ATTRIBUTE_WEAK
-  void* tcmalloc_hooked_sbrk(intptr_t increment) {
-    return sbrk(increment);
-  }
-}
-#endif
-
-void* SbrkSysAllocator::Alloc(size_t size, size_t *actual_size,
-                              size_t alignment) {
+void* SbrkSysAllocator::Alloc(size_t size, size_t* actual_size, size_t alignment) {
 #if !defined(HAVE_SBRK) || defined(__UCLIBC__)
-  return NULL;
+  return nullptr;
 #else
   // Check if we should use sbrk allocation.
   // FLAGS_malloc_skip_sbrk starts out as false (its uninitialized
@@ -192,12 +171,12 @@ void* SbrkSysAllocator::Alloc(size_t size, size_t *actual_size,
   // That means that even if this flag is set to true, some (initial)
   // memory will be allocated with sbrk before the flag takes effect.
   if (FLAGS_malloc_skip_sbrk) {
-    return NULL;
+    return nullptr;
   }
 
   // sbrk will release memory if passed a negative number, so we do
   // a strict check here
-  if (static_cast<ptrdiff_t>(size + alignment) < 0) return NULL;
+  if (static_cast<ptrdiff_t>(size + alignment) < 0) return nullptr;
 
   // This doesn't overflow because TCMalloc_SystemAlloc has already
   // tested for overflow at the alignment boundary.
@@ -216,22 +195,22 @@ void* SbrkSysAllocator::Alloc(size_t size, size_t *actual_size,
   //    http://src.opensolaris.org/source/xref/onnv/onnv-gate/usr/src/lib/libc/port/sys/sbrk.c?a=true
   //    http://sourceware.org/cgi-bin/cvsweb.cgi/~checkout~/libc/misc/sbrk.c?rev=1.1.2.1&content-type=text/plain&cvsroot=glibc
   // Without this check, sbrk may succeed when it ought to fail.)
-  if (reinterpret_cast<intptr_t>(tcmalloc_hooked_sbrk(0)) + size < size) {
-    return NULL;
+  if (reinterpret_cast<intptr_t>(sbrk(0)) + size < size) {
+    return nullptr;
   }
 
-  void* result = tcmalloc_hooked_sbrk(size);
+  void* result = sbrk(size);
   if (result == reinterpret_cast<void*>(-1)) {
-    return NULL;
+    return nullptr;
   }
 
   // Is it aligned?
   uintptr_t ptr = reinterpret_cast<uintptr_t>(result);
-  if ((ptr & (alignment-1)) == 0)  return result;
+  if ((ptr & (alignment - 1)) == 0) return result;
 
   // Try to get more memory for alignment
-  size_t extra = alignment - (ptr & (alignment-1));
-  void* r2 = tcmalloc_hooked_sbrk(extra);
+  size_t extra = alignment - (ptr & (alignment - 1));
+  void* r2 = sbrk(extra);
   if (reinterpret_cast<uintptr_t>(r2) == (ptr + size)) {
     // Contiguous with previous result
     return reinterpret_cast<void*>(ptr + extra);
@@ -239,23 +218,19 @@ void* SbrkSysAllocator::Alloc(size_t size, size_t *actual_size,
 
   // Give up and ask for "size + alignment - 1" bytes so
   // that we can find an aligned region within it.
-  result = tcmalloc_hooked_sbrk(size + alignment - 1);
+  result = sbrk(size + alignment - 1);
   if (result == reinterpret_cast<void*>(-1)) {
-    return NULL;
+    return nullptr;
   }
   ptr = reinterpret_cast<uintptr_t>(result);
-  if ((ptr & (alignment-1)) != 0) {
-    ptr += alignment - (ptr & (alignment-1));
+  if ((ptr & (alignment - 1)) != 0) {
+    ptr += alignment - (ptr & (alignment - 1));
   }
   return reinterpret_cast<void*>(ptr);
 #endif  // HAVE_SBRK
 }
 
-void* MmapSysAllocator::Alloc(size_t size, size_t *actual_size,
-                              size_t alignment) {
-#ifndef HAVE_MMAP
-  return nullptr;
-#else
+void* MmapSysAllocator::Alloc(size_t size, size_t* actual_size, size_t alignment) {
   // Check if we should use mmap allocation.
   // FLAGS_malloc_skip_mmap starts out as false (its uninitialized
   // state) and eventually gets initialized to the specified value.  Note
@@ -281,27 +256,31 @@ void* MmapSysAllocator::Alloc(size_t size, size_t *actual_size,
     *actual_size = size;
   }
 
+  tcmalloc::MMapResult mmap_result;
+
+  // We try to 'continue' previous mapping. But we first check that
+  // alignment requirements are met and that it won't overflow address
+  // space.'
   if (hint_ && hint_ + size > size && (hint_ & (alignment - 1)) == 0) {
-    // We try to 'continue' previous mapping. But we first check that
-    // alignment requirements are met and that it won't overflow
-    // address space.
-    void* result = mmap(reinterpret_cast<void*>(hint_), size,
-                        PROT_READ|PROT_WRITE,
-                        MAP_PRIVATE|MAP_ANONYMOUS,
-                        -1, 0);
+    mmap_result = tcmalloc::MapAnonymousWithHint(size, hint_);
 
-    uintptr_t ptr = reinterpret_cast<uintptr_t>(result);
-
-    // If the new mapping (even if at different address than hint
-    // passed) requested alignment, then we return it.
-    if ((ptr & (alignment - 1)) == 0) {
-      hint_ = ptr + size;
-      return result;
+    if (mmap_result.success) {
+      // If the new mapping (even if at different address than hint
+      // passed) doesn't satisfy requested alignment, then we return
+      // it.
+      if ((mmap_result.AsNumber() & (alignment - 1)) != 0) {
+        munmap(mmap_result.addr, size);
+        mmap_result.success = false;
+      }
     }
 
-    // Otherwise, we unmap and run "full" logic that is able to align
-    // to arbitrary alignment. And that doesn't use hint.
-    munmap(result, size);
+    if (mmap_result.success) {
+      hint_ = mmap_result.AsNumber() + size;
+      return mmap_result.addr;
+    }
+
+    // Otherwise, we unmap and run "full" logic that is able to
+    // align to arbitrary alignment. And that doesn't use hint.
   }
 
   // Ask for extra memory if alignment > pagesize
@@ -314,16 +293,13 @@ void* MmapSysAllocator::Alloc(size_t size, size_t *actual_size,
   //            size + alignment < (1<<NBITS).
   // and        extra <= alignment
   // therefore  size + extra < (1<<NBITS)
-  void* result = mmap(nullptr, size + extra,
-                      PROT_READ|PROT_WRITE,
-                      MAP_PRIVATE|MAP_ANONYMOUS,
-                      -1, 0);
-  if (result == reinterpret_cast<void*>(MAP_FAILED)) {
+  mmap_result = tcmalloc::MapAnonymous(size + extra);
+  if (!mmap_result.success) {
     return nullptr;
   }
 
   // Adjust the return memory so it is aligned
-  uintptr_t ptr = reinterpret_cast<uintptr_t>(result);
+  uintptr_t ptr = mmap_result.AsNumber();
   size_t adjust = 0;
   if ((ptr & (alignment - 1)) != 0) {
     adjust = alignment - (ptr & (alignment - 1));
@@ -340,15 +316,13 @@ void* MmapSysAllocator::Alloc(size_t size, size_t *actual_size,
   ptr += adjust;
   hint_ = ptr + size;
   return reinterpret_cast<void*>(ptr);
-#endif  // HAVE_MMAP
 }
 
-void* DefaultSysAllocator::Alloc(size_t size, size_t *actual_size,
-                                 size_t alignment) {
+void* DefaultSysAllocator::Alloc(size_t size, size_t* actual_size, size_t alignment) {
   for (int i = 0; i < kMaxAllocators; i++) {
-    if (!failed_[i] && allocs_[i] != NULL) {
+    if (!failed_[i] && allocs_[i] != nullptr) {
       void* result = allocs_[i]->Alloc(size, actual_size, alignment);
-      if (result != NULL) {
+      if (result != nullptr) {
         return result;
       }
       failed_[i] = true;
@@ -359,19 +333,13 @@ void* DefaultSysAllocator::Alloc(size_t size, size_t *actual_size,
   for (int i = 0; i < kMaxAllocators; i++) {
     failed_[i] = false;
   }
-  return NULL;
-}
-
-ATTRIBUTE_WEAK ATTRIBUTE_NOINLINE
-SysAllocator *tc_get_sysalloc_override(SysAllocator *def)
-{
-  return def;
+  return nullptr;
 }
 
 static bool system_alloc_inited = false;
 void InitSystemAllocators(void) {
-  MmapSysAllocator *mmap = mmap_space.Construct();
-  SbrkSysAllocator *sbrk = sbrk_space.Construct();
+  MmapSysAllocator* mmap = mmap_space.Construct();
+  SbrkSysAllocator* sbrk = sbrk_space.Construct();
 
   // In 64-bit debug mode, place the mmap allocator first since it
   // allocates pointers that do not fit in 32 bits and therefore gives
@@ -380,7 +348,7 @@ void InitSystemAllocators(void) {
   // likely to look like pointers and therefore the conservative gc in
   // the heap-checker is less likely to misinterpret a number as a
   // pointer).
-  DefaultSysAllocator *sdef = default_space.Construct();
+  DefaultSysAllocator* sdef = default_space.Construct();
   bool want_mmap = kDebugMode && (sizeof(void*) > 4);
   if (want_mmap) {
     sdef->SetChildAllocator(mmap, 0, mmap_name);
@@ -393,10 +361,11 @@ void InitSystemAllocators(void) {
   tcmalloc_sys_alloc = tc_get_sysalloc_override(sdef);
 }
 
-void* TCMalloc_SystemAlloc(size_t size, size_t *actual_size,
-                           size_t alignment) {
+}  // anonymous namespace
+
+void* TCMalloc_SystemAlloc(size_t size, size_t* actual_size, size_t alignment) {
   // Discard requests that overflow
-  if (size + alignment < size) return NULL;
+  if (size + alignment < size) return nullptr;
 
   SpinLockHolder lock_holder(&spinlock);
 
@@ -409,14 +378,13 @@ void* TCMalloc_SystemAlloc(size_t size, size_t *actual_size,
   if (alignment < sizeof(MemoryAligner)) alignment = sizeof(MemoryAligner);
 
   size_t actual_size_storage;
-  if (actual_size == NULL) {
+  if (actual_size == nullptr) {
     actual_size = &actual_size_storage;
   }
 
   void* result = tcmalloc_sys_alloc->Alloc(size, actual_size, alignment);
-  if (result != NULL) {
-    CHECK_CONDITION(
-      CheckAddressBits(reinterpret_cast<uintptr_t>(result) + *actual_size - 1));
+  if (result != nullptr) {
+    CHECK_CONDITION(CheckAddressBits(reinterpret_cast<uintptr_t>(result) + *actual_size - 1));
     TCMalloc_SystemTaken += *actual_size;
   }
   return result;
@@ -449,13 +417,12 @@ bool TCMalloc_SystemRelease(void* start, size_t length) {
       // mmap PROT_NONE is similar to munmap by freeing backing pages by
       // physical memory except using MAP_FIXED keeps virtual memory range
       // reserved to be remapped back later
-      void* ret = mmap(reinterpret_cast<char*>(new_start), new_end - new_start,
-          PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
+      void* ret = mmap(reinterpret_cast<char*>(new_start), new_end - new_start, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 
       result = ret != MAP_FAILED;
 #else
-      int ret = madvise(reinterpret_cast<char*>(new_start),
-          new_end - new_start, MADV_FREE);
+      int ret = madvise(reinterpret_cast<char*>(new_start), new_end - new_start, MADV_FREE);
 
       result = ret != -1;
 #endif
@@ -464,19 +431,20 @@ bool TCMalloc_SystemRelease(void* start, size_t length) {
 
     return result;
   }
-#endif 
+#endif
   return false;
 }
 
 void TCMalloc_SystemCommit(void* start, size_t length) {
 #if defined(FREE_MMAP_PROT_NONE) && defined(HAVE_MMAP)
-  // remaping as MAP_FIXED to same address assuming span size did not change 
+  // remaping as MAP_FIXED to same address assuming span size did not change
   // since last TCMalloc_SystemRelease
-  mmap(start, length, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,
-       -1, 0);
+  mmap(start, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 #else
   // Nothing to do here.  TCMalloc_SystemRelease does not alter pages
   // such that they need to be re-committed before they can be used by the
   // application.
 #endif
 }
+
+SpinLock* GetSysAllocLock() { return &spinlock; }

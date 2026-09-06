@@ -42,11 +42,11 @@
 
 namespace tcmalloc {
 
-class ATTRIBUTE_HIDDEN TestingPortal {
-public:
+class ATTRIBUTE_VISIBILITY_HIDDEN TestingPortal {
+ public:
   static inline constexpr char kMagic[] = "tcmalloc.impl.testing-portal";
   static TestingPortal* Get() {
-    static TestingPortal* instance = ([] () {
+    static TestingPortal* instance = ([]() {
       struct {
         TestingPortal* ptr = nullptr;
         size_t v = 0;
@@ -69,7 +69,7 @@ public:
 
   virtual bool HaveSystemRelease() = 0;
   virtual bool IsDebuggingMalloc() = 0;
-  virtual size_t GetPageSize() = 0;
+  virtual size_t GetMinSpanSize() = 0;
   virtual size_t GetMinAlign() = 0;
   virtual size_t GetMaxSize() = 0;
   virtual int64_t& GetSampleParameter() = 0;
@@ -77,13 +77,15 @@ public:
   virtual int32_t& GetMaxFreeQueueSize() = 0;
 
   virtual bool HasEmergencyMalloc() = 0;
+  virtual bool IsEmergencyPtr(void* ptr) = 0;
   virtual void WithEmergencyMallocEnabled(FunctionRef<void()> body) = 0;
 
-  // For heap checker unit test
-  virtual std::string_view GetHeapCheckFlag() = 0;
-  virtual void IterateMemoryRegionMap(FunctionRef<void(const void*)> callback) = 0;
+  virtual uint32_t GetSizeClass(void* ptr) = 0;
 
-protected:
+  virtual void* RunReallocWithCallback(void* old_ptr, size_t new_size, void (*invalid_free_fn)(void*),
+                                       size_t (*invalid_get_size_fn)(const void*)) = 0;
+
+ protected:
   virtual ~TestingPortal();
 };
 

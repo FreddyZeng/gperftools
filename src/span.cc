@@ -34,11 +34,9 @@
 #include <config.h>
 #include "span.h"
 
-#include <string.h>                     // for NULL, memset
-
-#include "internal_logging.h"  // for ASSERT
+#include "internal_logging.h"     // for ASSERT
 #include "page_heap_allocator.h"  // for PageHeapAllocator
-#include "static_vars.h"       // for Static
+#include "static_vars.h"          // for Static
 
 namespace tcmalloc {
 
@@ -50,9 +48,7 @@ Span* NewSpan(PageID p, Length len) {
   return result;
 }
 
-void DeleteSpan(Span* span) {
-  Static::span_allocator()->Delete(span);
-}
+void DeleteSpan(Span* span) { Static::span_allocator()->Delete(span); }
 
 void DLL_Init(Span* list) {
   list->next = list;
@@ -62,8 +58,8 @@ void DLL_Init(Span* list) {
 void DLL_Remove(Span* span) {
   span->prev->next = span->next;
   span->next->prev = span->prev;
-  span->prev = NULL;
-  span->next = NULL;
+  span->prev = nullptr;
+  span->next = nullptr;
 }
 
 int DLL_Length(const Span* list) {
@@ -75,8 +71,8 @@ int DLL_Length(const Span* list) {
 }
 
 void DLL_Prepend(Span* list, Span* span) {
-  ASSERT(span->next == NULL);
-  ASSERT(span->prev == NULL);
+  ASSERT(span->next == nullptr);
+  ASSERT(span->prev == nullptr);
   span->next = list->next;
   span->prev = list;
   list->next->prev = span;

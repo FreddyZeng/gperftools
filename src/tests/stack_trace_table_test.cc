@@ -5,19 +5,14 @@
 // Use of this source code is governed by a BSD-style license that can
 // be found in the LICENSE file.
 
-
 #include "config_for_unittests.h"
 
 #include "stack_trace_table.h"
 
-#include <stdio.h>
-
-#include <vector>
-
 #include "gtest/gtest.h"
 
 class StackTraceTableTestHelper {
-public:
+ public:
   using StackTrace = tcmalloc::StackTrace;
 
   struct Entry {
@@ -35,11 +30,12 @@ public:
 
   std::unique_ptr<void*[]> DumpTraces() {
     auto retval = ProduceStackTracesDump(
-      +[] (const void** current_head) {
-        const Entry* head = static_cast<const Entry*>(*current_head);
-        *current_head = head->next.get();
-        return &head->trace;
-      }, head_.get());
+        +[](const void** current_head) {
+          const Entry* head = static_cast<const Entry*>(*current_head);
+          *current_head = head->next.get();
+          return &head->trace;
+        },
+        head_.get());
 
     head_.reset();
     return retval;
@@ -51,7 +47,8 @@ public:
       EXPECT_EQ(reinterpret_cast<uintptr_t>(entries[i]), expected[i]);
     }
   }
-private:
+
+ private:
   EntryPtr head_;
 };
 

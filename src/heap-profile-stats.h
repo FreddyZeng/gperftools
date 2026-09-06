@@ -28,9 +28,9 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// This file defines structs to accumulate memory allocation and deallocation
-// counts.  These structs are commonly used for malloc (in HeapProfileTable)
-// and mmap (in MemoryRegionMap).
+// This file defines structs to accumulate memory allocation and
+// deallocation counts.  These structs are commonly used for malloc
+// profiles (in HeapProfileTable).
 
 // A bucket is data structure for heap profiling to store a pair of a stack
 // trace and counts of (de)allocation.  Buckets are stored in a hash table
@@ -41,21 +41,22 @@
 // are implemented with the member "HeapProfileBucket* next".
 //
 // A structure of a hash table HeapProfileBucket** bucket_table would be like:
-// bucket_table[0] => NULL
-// bucket_table[1] => HeapProfileBucket() => HeapProfileBucket() => NULL
+// bucket_table[0] => nullptr
+// bucket_table[1] => HeapProfileBucket() => HeapProfileBucket() => nullptr
 // ...
-// bucket_table[i] => HeapProfileBucket() => NULL
+// bucket_table[i] => HeapProfileBucket() => nullptr
 // ...
-// bucket_table[n] => HeapProfileBucket() => NULL
+// bucket_table[n] => HeapProfileBucket() => nullptr
 
 #ifndef HEAP_PROFILE_STATS_H_
 #define HEAP_PROFILE_STATS_H_
 
+#include <stdint.h>
+
 struct HeapProfileStats {
   // Returns true if the two HeapProfileStats are semantically equal.
   bool Equivalent(const HeapProfileStats& other) const {
-    return allocs - frees == other.allocs - other.frees &&
-        alloc_size - free_size == other.alloc_size - other.free_size;
+    return allocs - frees == other.allocs - other.frees && alloc_size - free_size == other.alloc_size - other.free_size;
   }
 
   int64_t allocs;      // Number of allocation calls.

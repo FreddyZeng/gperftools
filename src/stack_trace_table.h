@@ -37,7 +37,7 @@
 #define TCMALLOC_STACK_TRACE_TABLE_H_
 #include "config.h"
 
-#include <stdint.h>                     // for uintptr_t
+#include <stdint.h>  // for uintptr_t
 
 #include <memory>
 
@@ -59,9 +59,7 @@ class StackTraceTable {
  public:
   // REQUIRES: L < pageheap_lock
   StackTraceTable() = default;
-  ~StackTraceTable() {
-    ASSERT(head_ == nullptr);
-  }
+  ~StackTraceTable() { ASSERT(head_ == nullptr); }
 
   // Adds stack trace "t" to table.
   //
@@ -69,7 +67,7 @@ class StackTraceTable {
   void AddTrace(const StackTrace& t);
 
   // Returns stack traces formatted per MallocExtension guidelines.
-  // May return NULL on error.  Clears state before returning.
+  // May return nullptr on error.  Clears state before returning.
   //
   // REQUIRES: L < pageheap_lock
   void** ReadStackTracesAndClear();

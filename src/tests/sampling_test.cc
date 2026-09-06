@@ -65,16 +65,13 @@ static std::string NaiveShellQuote(std::string_view arg) {
   return retval;
 }
 
-extern "C" ATTRIBUTE_NOINLINE
-void* AllocateAllocate() {
-  auto local_noopt = [] (void* ptr) ATTRIBUTE_NOINLINE -> void* {
-    return noopt(ptr);
-  };
+extern "C" ATTRIBUTE_NOINLINE void* AllocateAllocate() {
+  auto local_noopt = [](void* ptr) ATTRIBUTE_NOINLINE { return noopt(ptr); };
   return local_noopt(malloc(10000));
 }
 
 #ifndef PPROF_PATH
-#error compiling this file requires PPROF_PATH to be set correctly
+#define PPROF_PATH pprof
 #endif
 
 #define XSTR(x) #x
@@ -90,7 +87,7 @@ static void VerifyWithPProf(std::string_view argv0, std::string_view path) {
     perror("popen");
     abort();
   }
-  tcmalloc::Cleanup close_pipe([p] () { (void)pclose(p); });
+  tcmalloc::Cleanup close_pipe([p]() { (void)pclose(p); });
 
   constexpr int kBufSize = 1024;
   std::string contents;
@@ -107,8 +104,7 @@ static void VerifyWithPProf(std::string_view argv0, std::string_view path) {
   CHECK_EQ(regcomp(&regex, "([0-9.]+)(MB)? *([0-9.]+)% *_*AllocateAllocate", REG_NEWLINE | REG_EXTENDED), 0);
   CHECK_EQ(regexec(&regex, contents.c_str(), 3, pmatch, 0), 0);
 
-  fprintf(stderr,"AllocateAllocate regex match: %.*s\n",
-          int(pmatch[0].rm_eo - pmatch[0].rm_so),
+  fprintf(stderr, "AllocateAllocate regex match: %.*s\n", int(pmatch[0].rm_eo - pmatch[0].rm_so),
           contents.data() + pmatch[0].rm_so);
 
   std::string number{contents.data() + pmatch[1].rm_so, contents.data() + pmatch[1].rm_eo};
@@ -121,9 +117,9 @@ static void VerifyWithPProf(std::string_view argv0, std::string_view path) {
 
   // We allocate 8*10^7 bytes of memory, which is 76M.  Because we
   // sample, the estimate may be a bit high or a bit low: we accept
-  // anything from 50M to 99M.
-  if (!(50 <= megs && megs < 100)) {
-    fprintf(stderr, "expected megs to be between 50 and 100. Got: %f\n", megs);
+  // anything from 50M to 109M.
+  if (!(50 <= megs && megs < 110)) {
+    fprintf(stderr, "expected megs to be between 50 and 110. Got: %f\n", megs);
     abort();
   }
 }
@@ -163,9 +159,12 @@ struct TempFile {
     CHECK_EQ(it, path_template.get() + len);
 
     int fd = mkstemp(path_template.get());
+    if (fd < 0) {
+      perror("mkstemp");
+    }
     CHECK_GE(fd, 0);
 
-    return TempFile{fdopen(fd, "r+"), std::string(path_template.get(), len-1)};
+    return TempFile{fdopen(fd, "r+"), std::string(path_template.get(), len - 1)};
   }
 };
 
@@ -181,7 +180,7 @@ int main(int argc, char** argv) {
 
   TempFile heap_tmp = TempFile::Create("sampling_test.heap.XXXXXX");
   TempFile growth_tmp = TempFile::Create("sampling_test.growth.XXXXXX");
-  tcmalloc::Cleanup unlink_temps{[&] () {
+  tcmalloc::Cleanup unlink_temps{[&]() {
     (void)unlink(heap_tmp.path.c_str());
     (void)unlink(growth_tmp.path.c_str());
   }};

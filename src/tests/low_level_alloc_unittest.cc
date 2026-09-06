@@ -36,19 +36,20 @@
 #include <stdio.h>
 #include <map>
 
-#include <gperftools/malloc_hook.h>
 #include "gtest/gtest.h"
+
+using tcmalloc::LowLevelAlloc;
 
 // a block of memory obtained from the allocator
 struct BlockDesc {
-  char *ptr;      // pointer to memory
-  int len;        // number of bytes
-  int fill;       // filled with data starting with this
+  char* ptr;  // pointer to memory
+  int len;    // number of bytes
+  int fill;   // filled with data starting with this
 };
 
 // Check that the pattern placed in the block d
 // by RandomizeBlockDesc is still there.
-static void CheckBlockDesc(const BlockDesc &d) {
+static void CheckBlockDesc(const BlockDesc& d) {
   for (int i = 0; i != d.len; i++) {
     ASSERT_TRUE((d.ptr[i] & 0xff) == ((d.fill + i) & 0xff));
   }
@@ -56,12 +57,44 @@ static void CheckBlockDesc(const BlockDesc &d) {
 
 // Fill the block "*d" with a pattern
 // starting with a random byte.
-static void RandomizeBlockDesc(BlockDesc *d) {
+static void RandomizeBlockDesc(BlockDesc* d) {
   d->fill = rand() & 0xff;
   for (int i = 0; i != d->len; i++) {
     d->ptr[i] = (d->fill + i) & 0xff;
   }
 }
+
+class TestPagesAllocator : public LowLevelAlloc::PagesAllocator {
+ public:
+  struct TestHeader {
+    static inline constexpr uint32_t kMagic = 0x74e5ca8;
+
+    const uint32_t magic = kMagic;
+    const size_t size;
+    TestHeader(size_t size) : size(size) {}
+  };
+
+  uint64_t uses_count{};
+  uint64_t in_use{};
+
+  ~TestPagesAllocator() override = default;
+
+  std::pair<void*, size_t> MapPages(size_t size) override {
+    auto memory = (::operator new)(size + sizeof(TestHeader));
+    TestHeader* hdr = new (memory) TestHeader(size);
+    uses_count++;
+    in_use += size;
+    return {hdr + 1, size};
+  }
+
+  void UnMapPages(void* addr, size_t size) override {
+    TestHeader* hdr = reinterpret_cast<TestHeader*>(addr) - 1;
+    ASSERT_TRUE(hdr->size == size);
+    ASSERT_TRUE(hdr->magic == TestHeader::kMagic);
+    in_use -= size;
+    (::operator delete)(hdr, size + sizeof(TestHeader));
+  }
+};
 
 // n times, toss a coin, and based on the outcome
 // either allocate a new block or deallocate an old block.
@@ -78,9 +111,12 @@ static void ExerciseAllocator(bool use_new_arena, int n) {
   AllocMap::iterator it;
   BlockDesc block_desc;
   int rnd;
-  LowLevelAlloc::Arena *arena = 0;
+  LowLevelAlloc::Arena* arena = 0;
+
+  TestPagesAllocator test_allocator;
+
   if (use_new_arena) {
-    arena = LowLevelAlloc::NewArena(nullptr);
+    arena = LowLevelAlloc::NewArenaWithCustomAlloc(&test_allocator);
   }
   for (int i = 0; i != n; i++) {
     if (i != 0 && i % 10000 == 0) {
@@ -88,33 +124,30 @@ static void ExerciseAllocator(bool use_new_arena, int n) {
       fflush(stdout);
     }
 
-    switch(rand() & 1) {      // toss a coin
-    case 0:     // coin came up heads: add a block
-      block_desc.len = rand() & 0x3fff;
-      block_desc.ptr =
-        reinterpret_cast<char *>(
-                        arena == 0
-                        ? LowLevelAlloc::Alloc(block_desc.len)
-                        : LowLevelAlloc::AllocWithArena(block_desc.len, arena));
-      RandomizeBlockDesc(&block_desc);
-      rnd = rand();
-      it = allocated.find(rnd);
-      if (it != allocated.end()) {
-        CheckBlockDesc(it->second);
-        LowLevelAlloc::Free(it->second.ptr);
-        it->second = block_desc;
-      } else {
-        allocated[rnd] = block_desc;
-      }
-      break;
-    case 1:     // coin came up tails: remove a block
-      it = allocated.begin();
-      if (it != allocated.end()) {
-        CheckBlockDesc(it->second);
-        LowLevelAlloc::Free(it->second.ptr);
-        allocated.erase(it);
-      }
-      break;
+    switch (rand() & 1) {  // toss a coin
+      case 0:              // coin came up heads: add a block
+        block_desc.len = rand() & 0x3fff;
+        block_desc.ptr = reinterpret_cast<char*>(arena == 0 ? LowLevelAlloc::Alloc(block_desc.len)
+                                                            : LowLevelAlloc::AllocWithArena(block_desc.len, arena));
+        RandomizeBlockDesc(&block_desc);
+        rnd = rand();
+        it = allocated.find(rnd);
+        if (it != allocated.end()) {
+          CheckBlockDesc(it->second);
+          LowLevelAlloc::Free(it->second.ptr);
+          it->second = block_desc;
+        } else {
+          allocated[rnd] = block_desc;
+        }
+        break;
+      case 1:  // coin came up tails: remove a block
+        it = allocated.begin();
+        if (it != allocated.end()) {
+          CheckBlockDesc(it->second);
+          LowLevelAlloc::Free(it->second.ptr);
+          allocated.erase(it);
+        }
+        break;
     }
   }
   // remove all remaniing blocks
@@ -124,7 +157,10 @@ static void ExerciseAllocator(bool use_new_arena, int n) {
     allocated.erase(it);
   }
   if (use_new_arena) {
+    ASSERT_GT(test_allocator.uses_count, 0);
+    ASSERT_GT(test_allocator.in_use, 0);
     ASSERT_TRUE(LowLevelAlloc::DeleteArena(arena));
+    ASSERT_EQ(test_allocator.in_use, 0);
   }
 }
 

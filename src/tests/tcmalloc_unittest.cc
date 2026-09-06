@@ -56,36 +56,59 @@
 // doesn't sub-include stdlib.h, so we'll still get posix_memalign
 // when we #include stdlib.h.  Blah.
 #ifdef HAVE_UNISTD_H
-#include <unistd.h>                 // for testing sbrk hooks
+#include <unistd.h>  // for testing sbrk hooks
 #endif
-#include "tcmalloc_internal.h"      // must come early, to pick up posix_memalign
+#include "tcmalloc_internal.h"  // must come early, to pick up posix_memalign
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <stdint.h>                 // for intptr_t
-#include <sys/types.h>              // for size_t
+#include <stdint.h>     // for intptr_t
+#include <sys/types.h>  // for size_t
 #ifdef HAVE_FCNTL_H
-#include <fcntl.h>                  // for open; used with mmap-hook test
+#include <fcntl.h>  // for open; used with mmap-hook test
 #endif
 #ifdef HAVE_MALLOC_H
-#include <malloc.h>                 // defines pvalloc/etc on cygwin
+#include <malloc.h>  // defines pvalloc/etc on cygwin
 #endif
 #include <assert.h>
 
+#ifndef _WIN32
+#include <spawn.h>     // for posix_spawn
+#include <sys/wait.h>  // for waitpid
+#endif
+
 #include <algorithm>
+#include <array>
+#include <functional>
+#include <iterator>
 #include <mutex>
 #include <new>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "base/single_stepper.h"
+
+#if __linux__
+// for fork testing
+#include <errno.h>
+#include <sched.h>
+#include <semaphore.h>
+#include <unistd.h>
+
+#define HAVE_FORK_TESTING_SUPPORT
+#endif  // __linux__
 
 #include "gperftools/malloc_hook.h"
 #include "gperftools/malloc_extension.h"
 #include "gperftools/nallocx.h"
 #include "gperftools/tcmalloc.h"
 
-#include "base/function_ref.h"
+#include "base/environ.h"
 #include "base/cleanup.h"
+#include "base/function_ref.h"
+#include "base/logging.h"
 #include "base/static_storage.h"
 
 #include "tests/testutil.h"
@@ -94,8 +117,7 @@
 
 #include "gtest/gtest.h"
 
-#include "base/logging.h"
-
+static bool running_fork_testing;
 
 using tcmalloc::TestingPortal;
 
@@ -107,9 +129,7 @@ template <typename T, typename V>
 decltype(auto) SetFlag(T* ptr, V value) {
   T old_value = *ptr;
   *ptr = value;
-  return tcmalloc::Cleanup{[=] () {
-    *ptr = old_value;
-  }};
+  return tcmalloc::Cleanup{[=]() { *ptr = old_value; }};
 }
 
 struct NumericProperty {
@@ -120,15 +140,14 @@ struct NumericProperty {
   // Override sets this property to new value and returns
   // tcmalloc::Cleanup that returns it to previous setting.
   decltype(auto) Override(size_t new_value) const {
-    MallocExtension *e = MallocExtension::instance();
+    MallocExtension* e = MallocExtension::instance();
     size_t old_value;
 
     CHECK(e->GetNumericProperty(name, &old_value));
     CHECK(e->SetNumericProperty(name, new_value));
 
-    return tcmalloc::Cleanup{[old_value, name = name] () {
-      CHECK(MallocExtension::instance()->SetNumericProperty(name, old_value));
-    }};
+    return tcmalloc::Cleanup{
+        [old_value, name = name]() { CHECK(MallocExtension::instance()->SetNumericProperty(name, old_value)); }};
   }
 };
 
@@ -139,20 +158,19 @@ constexpr NumericProperty kAggressiveDecommit{"tcmalloc.aggressive_memory_decomm
 // Windows doesn't define pvalloc and a few other obsolete unix
 // functions; nor does it define posix_memalign (which is not obsolete).
 #if defined(_WIN32)
-# define cfree free         // don't bother to try to test these obsolete fns
-# define valloc malloc
-# define pvalloc malloc
+#define valloc malloc
+#define pvalloc malloc
 // I'd like to map posix_memalign to _aligned_malloc, but _aligned_malloc
 // must be paired with _aligned_free (not normal free), which is too
 // invasive a change to how we allocate memory here.  So just bail
 static bool kOSSupportsMemalign = false;
 static inline void* Memalign(size_t align, size_t size) {
-  //LOG(FATAL) << "memalign not supported on windows";
+  // LOG(FATAL) << "memalign not supported on windows";
   exit(1);
-  return NULL;
+  return nullptr;
 }
 static inline int PosixMemalign(void** ptr, size_t align, size_t size) {
-  //LOG(FATAL) << "posix_memalign not supported on windows";
+  // LOG(FATAL) << "posix_memalign not supported on windows";
   exit(1);
   return -1;
 }
@@ -162,21 +180,19 @@ static inline int PosixMemalign(void** ptr, size_t align, size_t size) {
 #elif defined(__APPLE__)
 static bool kOSSupportsMemalign = false;
 static inline void* Memalign(size_t align, size_t size) {
-  //LOG(FATAL) << "memalign not supported on OS X";
+  // LOG(FATAL) << "memalign not supported on OS X";
   exit(1);
-  return NULL;
+  return nullptr;
 }
 static inline int PosixMemalign(void** ptr, size_t align, size_t size) {
-  //LOG(FATAL) << "posix_memalign not supported on OS X";
+  // LOG(FATAL) << "posix_memalign not supported on OS X";
   exit(1);
   return -1;
 }
 
 #else
 static bool kOSSupportsMemalign = true;
-static inline void* Memalign(size_t align, size_t size) {
-  return noopt(memalign(align, noopt(size)));
-}
+static inline void* Memalign(size_t align, size_t size) { return noopt(memalign(align, noopt(size))); }
 static inline int PosixMemalign(void** ptr, size_t align, size_t size) {
   return noopt(posix_memalign(ptr, align, noopt(size)));
 }
@@ -185,22 +201,20 @@ static inline int PosixMemalign(void** ptr, size_t align, size_t size) {
 
 static constexpr size_t kOveralignment = 64;
 
-struct overaligned_type
-{
-  alignas(kOveralignment)
-  unsigned char data[kOveralignment * 2]; // make the object size different from
-                                          // alignment to make sure the correct
-                                          // values are passed to the new/delete
-                                          // implementation functions
+struct overaligned_type {
+  alignas(kOveralignment) unsigned char data[kOveralignment * 2];  // make the object size different from
+                                                                   // alignment to make sure the correct
+                                                                   // values are passed to the new/delete
+                                                                   // implementation functions
 };
 
 struct OOMAbleSysAlloc : public SysAllocator {
-  SysAllocator *child;
+  SysAllocator* child;
   int simulate_oom;
 
   void* Alloc(size_t size, size_t* actual_size, size_t alignment) {
     if (simulate_oom) {
-      return NULL;
+      return nullptr;
     }
     return child->Alloc(size, actual_size, alignment);
   }
@@ -212,9 +226,9 @@ static OOMAbleSysAlloc* get_test_sys_alloc() {
 }
 
 void setup_oomable_sys_alloc() {
-  SysAllocator *def = MallocExtension::instance()->GetSystemAllocator();
+  SysAllocator* def = MallocExtension::instance()->GetSystemAllocator();
 
-  OOMAbleSysAlloc *alloc = get_test_sys_alloc();
+  OOMAbleSysAlloc* alloc = get_test_sys_alloc();
   new (alloc) OOMAbleSysAlloc;
   alloc->child = def;
 
@@ -222,27 +236,27 @@ void setup_oomable_sys_alloc() {
 }
 
 static const int FLAGS_numtests = 50000;
-static const int FLAGS_log_every_n_tests = 50000; // log exactly once
+static const int FLAGS_log_every_n_tests = 50000;  // log exactly once
 
 // Testing parameters
-static const int FLAGS_lgmaxsize = 16;   // lg() of the max size object to alloc
-static const int FLAGS_numthreads = 10;  // Number of threads
-static const int FLAGS_threadmb = 4;     // Max memory size allocated by thread
-static const int FLAGS_lg_max_memalign = 18; // lg of max alignment for memalign
+static const int FLAGS_lgmaxsize = 16;        // lg() of the max size object to alloc
+static const int FLAGS_numthreads = 10;       // Number of threads
+static const int FLAGS_threadmb = 4;          // Max memory size allocated by thread
+static const int FLAGS_lg_max_memalign = 18;  // lg of max alignment for memalign
 
-static const double FLAGS_memalign_min_fraction = 0;    // min expected%
-static const double FLAGS_memalign_max_fraction = 0.4;  // max expected%
+static const double FLAGS_memalign_min_fraction = 0;         // min expected%
+static const double FLAGS_memalign_max_fraction = 0.4;       // max expected%
 static const double FLAGS_memalign_max_alignment_ratio = 6;  // alignment/size
 
 // Weights of different operations
-static const int FLAGS_allocweight = 50;    // Weight for picking allocation
-static const int FLAGS_freeweight = 50;     // Weight for picking free
-static const int FLAGS_updateweight = 10;   // Weight for picking update
-static const int FLAGS_passweight = 1;      // Weight for passing object
+static const int FLAGS_allocweight = 50;   // Weight for picking allocation
+static const int FLAGS_freeweight = 50;    // Weight for picking free
+static const int FLAGS_updateweight = 10;  // Weight for picking update
+static const int FLAGS_passweight = 1;     // Weight for passing object
 
 static const int kSizeBits = 8 * sizeof(size_t);
 static const size_t kMaxSize = ~static_cast<size_t>(0);
-static const size_t kMaxSignedSize = ((size_t(1) << (kSizeBits-1)) - 1);
+static const size_t kMaxSignedSize = ((size_t(1) << (kSizeBits - 1)) - 1);
 
 static const size_t kNotTooBig = 100000;
 // We want an allocation that is definitely more than main memory.  OS
@@ -258,14 +272,12 @@ class TestHarness {
   // Information kept per type
   struct Type {
     std::string name;
-    int         type;
-    int         weight;
+    int type;
+    int weight;
   };
 
  public:
-  TestHarness(int seed) {
-    srandom(seed);
-  }
+  TestHarness(int seed) { srandom(seed); }
 
   // Add operation type with specified weight.  When starting a new
   // iteration, an operation type is picked with probability
@@ -293,14 +305,14 @@ class TestHarness {
   // "base" random bits.  The effect is to pick a number in the range
   // [0,2^max_log-1] with bias towards smaller numbers.
   int Skewed(int max_log) {
-    const int base = random() % (max_log+1);
+    const int base = random() % (max_log + 1);
     return random() % (1 << base);
   }
 
  private:
-  std::vector<Type>     types_;             // Registered types
-  int                   total_weight_ = 0;  // Total weight of all types
-  int                   num_tests_ = 0;     // Num tests run so far
+  std::vector<Type> types_;  // Registered types
+  int total_weight_ = 0;     // Total weight of all types
+  int num_tests_ = 0;        // Num tests run so far
 };
 
 void TestHarness::AddType(int type, int weight, const char* name) {
@@ -329,8 +341,7 @@ int TestHarness::PickType() {
 
   CHECK(i < types_.size());
   if ((num_tests_ % FLAGS_log_every_n_tests) == 0) {
-    printf("  Test %d out of %d: %s\n",
-            num_tests_, FLAGS_numtests, types_[i].name.c_str());
+    printf("  Test %d out of %d: %s\n", num_tests_, FLAGS_numtests, types_[i].name.c_str());
   }
   return types_[i].type;
 }
@@ -345,9 +356,8 @@ class AllocatorState : public TestHarness {
       CHECK_LE(FLAGS_memalign_min_fraction, 1);
       double delta = FLAGS_memalign_max_fraction - FLAGS_memalign_min_fraction;
       CHECK_GE(delta, 0);
-      memalign_fraction_ = (Uniform(10000)/10000.0 * delta +
-                            FLAGS_memalign_min_fraction);
-      //printf("memalign fraction: %f\n", memalign_fraction_);
+      memalign_fraction_ = (Uniform(10000) / 10000.0 * delta + FLAGS_memalign_min_fraction);
+      // printf("memalign fraction: %f\n", memalign_fraction_);
     }
   }
   virtual ~AllocatorState() {}
@@ -359,14 +369,13 @@ class AllocatorState : public TestHarness {
       for (int i = 0; i < 5; i++) {
         size_t alignment = size_t{1} << Uniform(FLAGS_lg_max_memalign);
         if (alignment >= sizeof(intptr_t) &&
-            (size < sizeof(intptr_t) ||
-             alignment < FLAGS_memalign_max_alignment_ratio * size)) {
-          void *result = reinterpret_cast<void*>(static_cast<intptr_t>(0x1234));
+            (size < sizeof(intptr_t) || alignment < FLAGS_memalign_max_alignment_ratio * size)) {
+          void* result = reinterpret_cast<void*>(static_cast<intptr_t>(0x1234));
           int err = PosixMemalign(&result, alignment, size);
           if (err != 0) {
             CHECK_EQ(err, ENOMEM);
           }
-          return err == 0 ? result : NULL;
+          return err == 0 ? result : nullptr;
         }
       }
     }
@@ -377,25 +386,24 @@ class AllocatorState : public TestHarness {
   double memalign_fraction_;
 };
 
-
 // Info kept per thread
 class TesterThread {
  private:
   // Info kept per allocated object
   struct Object {
-    char*       ptr;                    // Allocated pointer
-    int         size;                   // Allocated size
-    int         generation;             // Generation counter of object contents
+    char* ptr;       // Allocated pointer
+    int size;        // Allocated size
+    int generation;  // Generation counter of object contents
   };
 
-  std::vector<std::unique_ptr<TesterThread>> &all_threads_;
+  std::vector<std::unique_ptr<TesterThread>>& all_threads_;
 
-  std::mutex            lock_;          // For passing in another thread's obj
-  int                   id_;            // My thread id
-  AllocatorState        rnd_;           // For generating random numbers
-  std::vector<Object>   heap_;          // This thread's heap
-  std::vector<Object>   passed_;        // Pending objects passed from others
-  size_t                heap_size_;     // Current heap size
+  std::mutex lock_;             // For passing in another thread's obj
+  int id_;                      // My thread id
+  AllocatorState rnd_;          // For generating random numbers
+  std::vector<Object> heap_;    // This thread's heap
+  std::vector<Object> passed_;  // Pending objects passed from others
+  size_t heap_size_;            // Current heap size
 
   // Type of operations
   enum Type { ALLOC, FREE, UPDATE, PASS };
@@ -403,10 +411,11 @@ class TesterThread {
   // ACM minimal standard random number generator.  (re-entrant.)
   class ACMRandom {
     int32_t seed_;
+
    public:
     explicit ACMRandom(int32_t seed) { seed_ = seed; }
     int32_t Next() {
-      const int32_t M = 2147483647L;   // 2^31-1
+      const int32_t M = 2147483647L;  // 2^31-1
       const int32_t A = 16807;
       // In effect, we are computing seed_ = (seed_ * A) % M, where M = 2^31-1
       uint32_t lo = A * (int32_t)(seed_ & 0xFFFF);
@@ -421,43 +430,48 @@ class TesterThread {
         lo &= M;
         ++lo;
       }
-      return (seed_ = (int32_t) lo);
+      return (seed_ = (int32_t)lo);
     }
   };
 
  public:
   TesterThread(std::vector<std::unique_ptr<TesterThread>>& all_threads, int id)
-    : all_threads_(all_threads),
-      id_(id),
-      rnd_(id+1),
-      heap_size_(0) {
-  }
+      : all_threads_(all_threads), id_(id), rnd_(id + 1), heap_size_(0) {}
 
-  virtual ~TesterThread() {
-  }
+  virtual ~TesterThread() {}
 
   virtual void Run() {
-    rnd_.AddType(ALLOC,  FLAGS_allocweight,   "allocate");
-    rnd_.AddType(FREE,   FLAGS_freeweight,    "free");
-    rnd_.AddType(UPDATE, FLAGS_updateweight,  "update");
-    rnd_.AddType(PASS,   FLAGS_passweight,    "pass");
+    rnd_.AddType(ALLOC, FLAGS_allocweight, "allocate");
+    rnd_.AddType(FREE, FLAGS_freeweight, "free");
+    rnd_.AddType(UPDATE, FLAGS_updateweight, "update");
+    rnd_.AddType(PASS, FLAGS_passweight, "pass");
 
     while (true) {
       AcquirePassedObjects();
 
       switch (rnd_.PickType()) {
-        case ALLOC:   AllocateObject(); break;
-        case FREE:    FreeObject();     break;
-        case UPDATE:  UpdateObject();   break;
-        case PASS:    PassObject();     break;
-        case -1:      goto done;
-        default:      CHECK(nullptr == "Unknown type");
+        case ALLOC:
+          AllocateObject();
+          break;
+        case FREE:
+          FreeObject();
+          break;
+        case UPDATE:
+          UpdateObject();
+          break;
+        case PASS:
+          PassObject();
+          break;
+        case -1:
+          goto done;
+        default:
+          CHECK(nullptr == "Unknown type");
       }
 
       ShrinkHeap();
     }
 
- done:
+  done:
     DeleteHeap();
   }
 
@@ -490,7 +504,7 @@ class TesterThread {
     CheckContents(object);
     free(object.ptr);
     heap_size_ -= object.size;
-    heap_[index] = heap_[heap_.size()-1];
+    heap_[index] = heap_[heap_.size() - 1];
     heap_.pop_back();
   }
 
@@ -526,7 +540,7 @@ class TesterThread {
       thread->passed_.push_back(object);
       thread->lock_.unlock();
       heap_size_ -= object.size;
-      heap_[index] = heap_[heap_.size()-1];
+      heap_[index] = heap_[heap_.size() - 1];
       heap_.pop_back();
     }
   }
@@ -537,7 +551,7 @@ class TesterThread {
     // TryLock().  Plus we unlock immediately after swapping passed
     // objects into a local vector.
     std::vector<Object> copy;
-    { // Locking scope
+    {  // Locking scope
       if (!lock_.try_lock()) {
         return;
       }
@@ -583,9 +597,34 @@ class TesterThread {
   }
 };
 
+TEST(TCMallocTest, Versions) {
+  auto build_version_string = [](int major, int minor, const char* patch) -> std::string {
+    CHECK(patch[0] == 0 || patch[0] == '.');  // patch version needs to start with dot
+    std::stringstream ss;
+    ss << "gperftools " << major << "." << minor << patch;
+    return ss.str();
+  };
+
+  // We make sure that TC_VERSION_STRING define matches
+  // TC_VERSION_MAJOR, TC_VERSION_MAJOR and TC_VERSION_PATCH (see
+  // tcmalloc.h)
+  std::string expected_version_string = build_version_string(TC_VERSION_MAJOR, TC_VERSION_MINOR, TC_VERSION_PATCH);
+  ASSERT_EQ(expected_version_string, std::string(TC_VERSION_STRING));
+
+  // autoconf's config.h has PACKAGE_VERSION that is taken from configure.ac
+#if defined(PACKAGE_VERSION)
+  // And we make sure that autoconf's idea of version matches what
+  // we've manually put into tcmalloc.h
+  ASSERT_EQ(expected_version_string, std::string("gperftools ") + PACKAGE_VERSION);
+#else
+  // Make sure we're able to exercise line above (we set this
+  // environment variable in test runner)
+  CHECK_EQ(getenv("GPERFTOOLS_ENSURE_PACKAGE_VERSION"), nullptr);
+#endif
+}
+
 TEST(TCMallocTest, ManyThreads) {
-  printf("Testing threaded allocation/deallocation (%d threads)\n",
-          FLAGS_numthreads);
+  printf("Testing threaded allocation/deallocation (%d threads)\n", FLAGS_numthreads);
 
   std::vector<std::unique_ptr<TesterThread>> ptrs;
   ptrs.reserve(FLAGS_numthreads);
@@ -598,9 +637,7 @@ TEST(TCMallocTest, ManyThreads) {
   std::vector<std::thread> threads;
   threads.reserve(FLAGS_numthreads);
   for (int i = 0; i < FLAGS_numthreads; i++) {
-    threads.emplace_back([thr = ptrs[i].get()] () {
-      thr->Run();
-    });
+    threads.emplace_back([thr = ptrs[i].get()]() { thr->Run(); });
   }
   for (auto& t : threads) {
     t.join();
@@ -609,23 +646,23 @@ TEST(TCMallocTest, ManyThreads) {
 
 static void TryHugeAllocation(size_t s, AllocatorState* rnd) {
   void* p = rnd->alloc(noopt(s));
-  CHECK(p == NULL);   // huge allocation s should fail!
+  CHECK(p == nullptr);  // huge allocation s should fail!
 }
 
 static void TestHugeAllocations(AllocatorState* rnd) {
   // Check that asking for stuff tiny bit smaller than largest possible
-  // size returns NULL.
+  // size returns nullptr.
   for (size_t i = 0; i < 70000; i += rnd->Uniform(20)) {
     TryHugeAllocation(kMaxSize - i, rnd);
   }
   // Asking for memory sizes near signed/unsigned boundary (kMaxSignedSize)
   // might work or not, depending on the amount of virtual memory.
   if (!TestingPortal::Get()->IsDebuggingMalloc()) {
-   // debug allocation takes forever for huge allocs
+    // debug allocation takes forever for huge allocs
     for (size_t i = 0; i < 100; i++) {
-      void* p = NULL;
+      void* p = nullptr;
       p = rnd->alloc(kMaxSignedSize + i);
-      if (p) free(p);    // if: free(NULL) is not necessarily defined
+      if (p) free(p);  // if: free(nullptr) is not necessarily defined
       p = rnd->alloc(kMaxSignedSize - i);
       if (p) free(p);
     }
@@ -641,10 +678,10 @@ static void TestHugeAllocations(AllocatorState* rnd) {
 static void TestCalloc(size_t n, size_t s, bool ok) {
   char* p = reinterpret_cast<char*>(noopt(calloc)(n, s));
   if (!ok) {
-    CHECK(p == NULL);  // calloc(n, s) should not succeed
+    CHECK(p == nullptr);  // calloc(n, s) should not succeed
   } else {
-    CHECK(p != NULL);  // calloc(n, s) should succeed
-    for (int i = 0; i < n*s; i++) {
+    CHECK(p != nullptr);  // calloc(n, s) should succeed
+    for (int i = 0; i < n * s; i++) {
       CHECK(p[i] == '\0');
     }
     free(p);
@@ -653,7 +690,9 @@ static void TestCalloc(size_t n, size_t s, bool ok) {
 
 // This makes sure that reallocing a small number of bytes in either
 // direction doesn't cause us to allocate new memory.
-TEST(TCMallocTest, Realloc) {
+class ReallocTest : public ::testing::TestWithParam<size_t> {};
+
+TEST_P(ReallocTest, Realloc) {
   if (TestingPortal::Get()->IsDebuggingMalloc()) {
     // debug alloc doesn't try to minimize reallocs
     return;
@@ -666,25 +705,40 @@ TEST(TCMallocTest, Realloc) {
   // turn off sampling
   tcmalloc::Cleanup cleanup = SetFlag(&TestingPortal::Get()->GetSampleParameter(), 0);
 
-  int start_sizes[] = { 100, 1000, 10000, 100000 };
-  int deltas[] = { 1, -2, 4, -8, 16, -32, 64, -128 };
+  size_t original_size = GetParam();
+  void* p = noopt(malloc(original_size));
+  ASSERT_NE(p, nullptr);
 
-  for (int s = 0; s < sizeof(start_sizes)/sizeof(*start_sizes); ++s) {
-    void* p = noopt(malloc(start_sizes[s]));
-    ASSERT_NE(p, nullptr);
-    // The larger the start-size, the larger the non-reallocing delta.
-    for (int d = 0; d < (s+1) * 2; ++d) {
-      void* new_p = noopt(realloc)(p, start_sizes[s] + deltas[d]);
-      ASSERT_EQ(p, new_p);  // realloc should not allocate new memory
-    }
-    // Test again, but this time reallocing smaller first.
-    for (int d = 0; d < s*2; ++d) {
-      void* new_p = noopt(realloc)(p, start_sizes[s] - deltas[d]);
-      ASSERT_EQ(p, new_p);  // realloc should not allocate new memory
-    }
-    free(p);
+  size_t usable_size = nallocx(original_size, 0);
+  // Validate out expectation
+  ASSERT_EQ(MallocExtension::instance()->GetAllocatedSize(p), usable_size);
+
+  // Lets find range of request sizes that round up to the same
+  // usable size by using nallocx.
+  size_t minimal_size = original_size;
+  while (nallocx(minimal_size - 1, 0) == usable_size) {
+    minimal_size--;
+    ASSERT_NE(minimal_size, 0);
   }
+
+  void* new_p;
+
+  // Check growing up to usable size then shrinking
+  new_p = noopt(realloc)(p, usable_size);
+  ASSERT_EQ(new_p, p);
+  new_p = noopt(realloc)(p, minimal_size);
+  ASSERT_EQ(new_p, p);
+
+  // Checking shrinking then growing
+  new_p = noopt(realloc)(p, minimal_size);
+  ASSERT_EQ(new_p, p);
+  new_p = noopt(realloc)(p, usable_size);
+  ASSERT_EQ(new_p, p);
+
+  free(p);
 }
+
+INSTANTIATE_TEST_SUITE_P(AllSizes, ReallocTest, ::testing::Values(100, 1000, 10000, 100000));
 
 #if __cpp_exceptions
 static int news_handled = 0;
@@ -796,30 +850,25 @@ TEST(TCMallocTest, OperatorsNewOOMs) {
 
 #endif  // __cpp_exceptions
 
-
 // These are used as callbacks by the sanity-check.  Set* and Reset*
 // register the hook that counts how many times the associated memory
 // function is called.  After each such call, call Verify* to verify
 // that we used the tcmalloc version of the call, and not the libc.
 // Note the ... in the hook signature: we don't care what arguments
 // the hook takes.
-#define MAKE_HOOK_CALLBACK(hook_type, ...)                              \
-  static volatile int g_##hook_type##_calls = 0;                                 \
-  static void IncrementCallsTo##hook_type(__VA_ARGS__) {                \
-    g_##hook_type##_calls++;                                            \
-  }                                                                     \
-  static void Verify##hook_type##WasCalled() {                          \
-    CHECK_GT(g_##hook_type##_calls, 0);                                 \
-    g_##hook_type##_calls = 0;  /* reset for next call */               \
-  }                                                                     \
-  static void Set##hook_type() {                                        \
-    CHECK(MallocHook::Add##hook_type(                                   \
-        (MallocHook::hook_type)&IncrementCallsTo##hook_type));          \
-  }                                                                     \
-  static void Reset##hook_type() {                                      \
-    g_##hook_type##_calls = 0;                                          \
-    CHECK(MallocHook::Remove##hook_type(                                \
-        (MallocHook::hook_type)&IncrementCallsTo##hook_type));          \
+#define MAKE_HOOK_CALLBACK(hook_type, ...)                                                       \
+  static volatile int g_##hook_type##_calls = 0;                                                 \
+  static void IncrementCallsTo##hook_type(__VA_ARGS__) { g_##hook_type##_calls++; }              \
+  static void Verify##hook_type##WasCalled() {                                                   \
+    CHECK_GT(g_##hook_type##_calls, 0);                                                          \
+    g_##hook_type##_calls = 0; /* reset for next call */                                         \
+  }                                                                                              \
+  static void Set##hook_type() {                                                                 \
+    CHECK(MallocHook::Add##hook_type((MallocHook::hook_type) & IncrementCallsTo##hook_type));    \
+  }                                                                                              \
+  static void Reset##hook_type() {                                                               \
+    g_##hook_type##_calls = 0;                                                                   \
+    CHECK(MallocHook::Remove##hook_type((MallocHook::hook_type) & IncrementCallsTo##hook_type)); \
   }
 
 // We do one for each hook typedef in malloc_hook.h
@@ -851,9 +900,9 @@ static void TestAlignmentForSize(int size) {
 
 TEST(TCMallocTest, MallocAlignment) {
   for (int lg = 0; lg < 16; lg++) {
-    TestAlignmentForSize((1<<lg) - 1);
-    TestAlignmentForSize((1<<lg) + 0);
-    TestAlignmentForSize((1<<lg) + 1);
+    TestAlignmentForSize((1 << lg) - 1);
+    TestAlignmentForSize((1 << lg) + 0);
+    TestAlignmentForSize((1 << lg) + 1);
   }
 }
 
@@ -874,11 +923,10 @@ TEST(TCMallocTest, HugeThreadCache) {
 // Check that at least one of the callbacks from Ranges() contains
 // the specified address with the specified type, and has size
 // >= min_size.
-static void CheckRangeCallback(void* ptr, base::MallocRange::Type type,
-                               size_t min_size) {
+static void CheckRangeCallback(void* ptr, base::MallocRange::Type type, size_t min_size) {
   bool matched = false;
   const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-  auto callback = [&] (const base::MallocRange* r) -> void {
+  auto callback = [&](const base::MallocRange* r) -> void {
     if (!(r->address <= addr && addr < r->address + r->length)) {
       return;
     }
@@ -887,8 +935,7 @@ static void CheckRangeCallback(void* ptr, base::MallocRange::Type type,
       // We are expecting r->type == FREE, but ReleaseMemory
       // may have already moved us to UNMAPPED state instead (this happens in
       // approximately 0.1% of executions). Accept either state.
-      CHECK(r->type == base::MallocRange::FREE ||
-            r->type == base::MallocRange::UNMAPPED);
+      CHECK(r->type == base::MallocRange::FREE || r->type == base::MallocRange::UNMAPPED);
     } else {
       CHECK_EQ(r->type, type);
     }
@@ -907,7 +954,7 @@ TEST(TCMallocTest, Ranges) {
   void* a = malloc(MB);
   void* b = malloc(MB);
   base::MallocRange::Type releasedType =
-    TestingPortal::Get()->HaveSystemRelease() ? base::MallocRange::UNMAPPED : base::MallocRange::FREE;
+      TestingPortal::Get()->HaveSystemRelease() ? base::MallocRange::UNMAPPED : base::MallocRange::FREE;
 
   CheckRangeCallback(a, base::MallocRange::INUSE, MB);
   CheckRangeCallback(b, base::MallocRange::INUSE, MB);
@@ -930,20 +977,19 @@ TEST(TCMallocTest, Ranges) {
 
 static size_t GetUnmappedBytes() {
   size_t bytes;
-  CHECK(MallocExtension::instance()->GetNumericProperty(
-          "tcmalloc.pageheap_unmapped_bytes", &bytes));
+  CHECK(MallocExtension::instance()->GetNumericProperty("tcmalloc.pageheap_unmapped_bytes", &bytes));
   return bytes;
 }
 
 TEST(TCMallocTest, ReleaseToSystem) {
   // Debug allocation mode adds overhead to each allocation which
   // messes up all the equality tests here.  I just disable the
-  // teset in this mode.
+  // test in this mode.
   if (TestingPortal::Get()->IsDebuggingMalloc()) {
     return;
   }
 
-  if(!TestingPortal::Get()->HaveSystemRelease()) return;
+  if (!TestingPortal::Get()->HaveSystemRelease()) return;
 
   tcmalloc::Cleanup release_rate_cleanup = SetFlag(&TestingPortal::Get()->GetReleaseRate(), 0);
   tcmalloc::Cleanup decommit_cleanup = kAggressiveDecommit.Override(0);
@@ -965,26 +1011,26 @@ TEST(TCMallocTest, ReleaseToSystem) {
   free(a);
 
   // The span to release should be 1MB.
-  MallocExtension::instance()->ReleaseToSystem(MB/2);
+  MallocExtension::instance()->ReleaseToSystem(MB / 2);
   EXPECT_EQ(starting_bytes + MB, GetUnmappedBytes());
 
   // Should do nothing since the previous call released too much.
-  MallocExtension::instance()->ReleaseToSystem(MB/4);
+  MallocExtension::instance()->ReleaseToSystem(MB / 4);
   EXPECT_EQ(starting_bytes + MB, GetUnmappedBytes());
 
   free(b);
 
   // Use up the extra MB/4 bytes from 'a' and also release 'b'.
-  MallocExtension::instance()->ReleaseToSystem(MB/2);
-  EXPECT_EQ(starting_bytes + 2*MB, GetUnmappedBytes());
+  MallocExtension::instance()->ReleaseToSystem(MB / 2);
+  EXPECT_EQ(starting_bytes + 2 * MB, GetUnmappedBytes());
 
   // Should do nothing since the previous call released too much.
-  MallocExtension::instance()->ReleaseToSystem(MB/2);
-  EXPECT_EQ(starting_bytes + 2*MB, GetUnmappedBytes());
+  MallocExtension::instance()->ReleaseToSystem(MB / 2);
+  EXPECT_EQ(starting_bytes + 2 * MB, GetUnmappedBytes());
 
   // Nothing else to release.
   MallocExtension::instance()->ReleaseFreeMemory();
-  EXPECT_EQ(starting_bytes + 2*MB, GetUnmappedBytes());
+  EXPECT_EQ(starting_bytes + 2 * MB, GetUnmappedBytes());
 
   a = noopt(malloc(MB));
   free(a);
@@ -992,14 +1038,116 @@ TEST(TCMallocTest, ReleaseToSystem) {
 
   // Releasing less than a page should still trigger a release.
   MallocExtension::instance()->ReleaseToSystem(1);
-  EXPECT_EQ(starting_bytes + 2*MB, GetUnmappedBytes());
+  EXPECT_EQ(starting_bytes + 2 * MB, GetUnmappedBytes());
+}
+
+TEST(TCMallocTest, LargeAllocsRelease) {
+  // Debug allocation mode adds overhead to each allocation which
+  // messes up all the equality tests here.  I just disable the
+  // test in this mode.
+  if (TestingPortal::Get()->IsDebuggingMalloc()) {
+    return;
+  }
+
+  if (!TestingPortal::Get()->HaveSystemRelease()) return;
+
+  tcmalloc::Cleanup release_rate_cleanup = SetFlag(&TestingPortal::Get()->GetReleaseRate(), 0);
+  tcmalloc::Cleanup decommit_cleanup = kAggressiveDecommit.Override(0);
+
+  // This test verifies special logic where page heap prefers reusing
+  // normal spans over touching returned spans for large allocations
+  // where spans are of the same size.
+  //
+  // We have the same logic for non-large spans.
+  //
+  // See github pull request
+  // https://github.com/gperftools/gperftools/pull/1604 and commit
+  // 32f11cb4b777880f7ecff3edcb5bc04fd6f1dff1 for motivation.
+
+  constexpr size_t kNumPtrs = 10;
+  constexpr size_t kBigAllocBytes = 3 << 20;
+
+  std::vector<std::unique_ptr<char[]>> cleanup;
+  std::vector<std::unique_ptr<char[]>> chunks;
+
+  auto alloc_big = [&]() -> std::unique_ptr<char[]> {
+    return std::unique_ptr<char[]>{noopt<char*>(new char[kBigAllocBytes])};
+  };
+
+  for (;;) {
+    // Ensure there is big large chunk of memory that is available. We
+    // want kNumPtrs * 2 successive chunks to be allocated in this
+    // space. This test is explicitly very picky in what behavior it
+    // triggers.
+    free(noopt(malloc(kNumPtrs * 2 * kBigAllocBytes)));
+
+    size_t i;
+    for (i = 0; i < kNumPtrs * 2; i++) {
+      chunks.emplace_back(alloc_big());
+      if (i > 0) {
+        if (chunks.rbegin()->get() != (chunks.rbegin() + 1)->get() + kBigAllocBytes) {
+          static int num_fail;
+          printf("successive allocation failure %d. Will retry\n", ++num_fail);
+          ASSERT_LE(num_fail, 32);
+          break;
+        }
+      }
+    }
+    if (i == kNumPtrs * 2) {
+      break;  // success
+    }
+
+    // Whatever we've got so far, lets ensure it is cleaned up. But after the test.
+    std::move(chunks.begin(), chunks.end(), std::back_inserter(cleanup));
+    chunks.clear();
+  }
+
+  std::array<std::unique_ptr<char[]>, kNumPtrs> used_ptrs;
+  std::array<std::unique_ptr<char[]>, kNumPtrs> free_ptrs;
+
+  for (size_t i = 0; i < kNumPtrs; ++i) {
+    // interleave used_ptrs and free_ptrs to prevent free_ptrs from coalescing
+    used_ptrs[i] = std::move(chunks[i * 2]);
+    free_ptrs[i] = std::move(chunks[i * 2 + 1]);
+  }
+
+  MallocExtension::instance()->ReleaseFreeMemory();
+
+  size_t starting_bytes = GetUnmappedBytes();
+
+  for (auto& ptr : free_ptrs) {
+    ptr.reset();
+  }
+  // Ensure that free-s just above did not cause any returns of memory
+  // to the kernel.
+  EXPECT_EQ(starting_bytes, GetUnmappedBytes());
+
+  // Here is the logic. So we're at the stage where only normal spans
+  // are from free-s (unique_ptr resets) just above. And there is some
+  // number of returned spans. As we call ReleaseToSystem with the
+  // exact span size, we will return one of those to the kernel and
+  // move the span to returned list.
+  for (size_t i = 0; i < 2 * kNumPtrs; ++i) {
+    MallocExtension::instance()->ReleaseToSystem(kBigAllocBytes);
+    // Then we expect the following allocation to take one of those
+    // normal spans (despite just returned span to have lower address).
+    //
+    // I.e. we want to avoid allocating the memory we just returned to
+    // the kernel. Which would grow RSS unnecessarily.
+    auto a = alloc_big();
+    a.reset();
+  }
+  MallocExtension::instance()->ReleaseToSystem(kBigAllocBytes);
+  // And finally we ensure that, indeed, we've returned all the chunks
+  // we've freed.
+  EXPECT_EQ(starting_bytes + kNumPtrs * kBigAllocBytes, GetUnmappedBytes());
 }
 
 TEST(TCMallocTest, AggressiveDecommit) {
   // Debug allocation mode adds overhead to each allocation which
   // messes up all the equality tests here.  I just disable the
   // teset in this mode.
-  if(TestingPortal::Get()->IsDebuggingMalloc() || !TestingPortal::Get()->HaveSystemRelease()) {
+  if (TestingPortal::Get()->IsDebuggingMalloc() || !TestingPortal::Get()->HaveSystemRelease()) {
     return;
   }
 
@@ -1026,16 +1174,16 @@ TEST(TCMallocTest, AggressiveDecommit) {
 
   free(b);
 
-  EXPECT_EQ(starting_bytes + 2*MB, GetUnmappedBytes());
+  EXPECT_EQ(starting_bytes + 2 * MB, GetUnmappedBytes());
 
   // Nothing else to release.
   MallocExtension::instance()->ReleaseFreeMemory();
-  EXPECT_EQ(starting_bytes + 2*MB, GetUnmappedBytes());
+  EXPECT_EQ(starting_bytes + 2 * MB, GetUnmappedBytes());
 
   a = noopt(malloc(MB));
   free(a);
 
-  EXPECT_EQ(starting_bytes + 2*MB, GetUnmappedBytes());
+  EXPECT_EQ(starting_bytes + 2 * MB, GetUnmappedBytes());
 
   printf("Done testing aggressive de-commit\n");
 }
@@ -1043,8 +1191,8 @@ TEST(TCMallocTest, AggressiveDecommit) {
 // On MSVC10, in release mode, the optimizer convinces itself
 // g_no_memory is never changed (I guess it doesn't realize OnNoMemory
 // might be called).  Work around this by setting the var volatile.
-volatile bool g_no_memory = false;
-std::new_handler g_old_handler = NULL;
+volatile bool g_no_memory;
+std::new_handler g_old_handler;
 static void OnNoMemory() {
   g_no_memory = true;
   std::set_new_handler(g_old_handler);
@@ -1056,19 +1204,19 @@ TEST(TCMallocTest, SetNewMode) {
   g_old_handler = std::set_new_handler(&OnNoMemory);
   g_no_memory = false;
   void* ret = noopt(malloc(noopt(kTooBig)));
-  EXPECT_EQ(NULL, ret);
+  EXPECT_EQ(nullptr, ret);
   EXPECT_TRUE(g_no_memory);
 
   g_old_handler = std::set_new_handler(&OnNoMemory);
   g_no_memory = false;
   ret = noopt(calloc(1, noopt(kTooBig)));
-  EXPECT_EQ(NULL, ret);
+  EXPECT_EQ(nullptr, ret);
   EXPECT_TRUE(g_no_memory);
 
   g_old_handler = std::set_new_handler(&OnNoMemory);
   g_no_memory = false;
   ret = noopt(realloc(nullptr, noopt(kTooBig)));
-  EXPECT_EQ(NULL, ret);
+  EXPECT_EQ(nullptr, ret);
   EXPECT_TRUE(g_no_memory);
 
   if (kOSSupportsMemalign) {
@@ -1079,14 +1227,13 @@ TEST(TCMallocTest, SetNewMode) {
     g_old_handler = std::set_new_handler(&OnNoMemory);
     g_no_memory = false;
     ret = Memalign(kAlignment, kTooBig);
-    EXPECT_EQ(NULL, ret);
+    EXPECT_EQ(nullptr, ret);
     EXPECT_TRUE(g_no_memory);
 
     g_old_handler = std::set_new_handler(&OnNoMemory);
     g_no_memory = false;
-    EXPECT_EQ(ENOMEM,
-              PosixMemalign(&ret, kAlignment, kTooBig));
-    EXPECT_EQ(NULL, ret);
+    EXPECT_EQ(ENOMEM, PosixMemalign(&ret, kAlignment, kTooBig));
+    EXPECT_EQ(nullptr, ret);
     EXPECT_TRUE(g_no_memory);
   }
 
@@ -1098,18 +1245,18 @@ TEST(TCMallocTest, TestErrno) {
   if (kOSSupportsMemalign) {
     errno = 0;
     ret = Memalign(128, kTooBig);
-    EXPECT_EQ(NULL, ret);
+    EXPECT_EQ(nullptr, ret);
     EXPECT_EQ(ENOMEM, errno);
   }
 
   errno = 0;
   ret = noopt(malloc(noopt(kTooBig)));
-  EXPECT_EQ(NULL, ret);
+  EXPECT_EQ(nullptr, ret);
   EXPECT_EQ(ENOMEM, errno);
 
   errno = 0;
   ret = tc_malloc_skip_new_handler(kTooBig);
-  EXPECT_EQ(NULL, ret);
+  EXPECT_EQ(nullptr, ret);
   EXPECT_EQ(ENOMEM, errno);
 }
 
@@ -1133,7 +1280,7 @@ static void check_global_nallocx() {
   CHECK_GT(nallocx(99, 0), 99);
 }
 
-#endif // __GNUC__
+#endif  // __GNUC__
 
 static size_t GrowNallocxTestSize(size_t sz) {
   if (sz < 1024) {
@@ -1183,9 +1330,7 @@ TEST(TCMallocTest, NAllocXAlignment) {
 }
 
 struct NewHandlerHelper {
-  NewHandlerHelper(NewHandlerHelper* prev) : prev(prev) {
-    memset(filler, 0, sizeof(filler));
-  }
+  NewHandlerHelper(NewHandlerHelper* prev) : prev(prev) { memset(filler, 0, sizeof(filler)); }
 
   NewHandlerHelper* Pop() {
     NewHandlerHelper* prev = this->prev;
@@ -1206,6 +1351,8 @@ static void test_new_handler() {
 }
 
 TEST(TCMallocTest, NewHandler) {
+  if (running_fork_testing) return;
+
   // debug allocator does internal allocations and crashes when such
   // internal allocation fails. So don't test it.
   if (TestingPortal::Get()->IsDebuggingMalloc()) {
@@ -1214,7 +1361,7 @@ TEST(TCMallocTest, NewHandler) {
 
   ASSERT_EQ(oom_test_last_ptr, nullptr);
   ASSERT_EQ(saw_new_handler_runs, 0);
-  tcmalloc::Cleanup clean_oom_testers([] () {
+  tcmalloc::Cleanup clean_oom_testers([]() {
     while (oom_test_last_ptr) {
       oom_test_last_ptr = oom_test_last_ptr->Pop();
     }
@@ -1224,9 +1371,7 @@ TEST(TCMallocTest, NewHandler) {
 
   std::new_handler old = std::set_new_handler(test_new_handler);
   get_test_sys_alloc()->simulate_oom = true;
-  tcmalloc::Cleanup restore_oom([] () {
-    get_test_sys_alloc()->simulate_oom = false;
-  });
+  tcmalloc::Cleanup restore_oom([]() { get_test_sys_alloc()->simulate_oom = false; });
 
   ASSERT_EQ(saw_new_handler_runs, 0);
 
@@ -1240,7 +1385,7 @@ TEST(TCMallocTest, NewHandler) {
   // failing to allocate internal metadata. It doesn't happen often
   // (and not with default order of tests), but something we'll need
   // to fix one day.
-  for (int i = 1<<24; i > 0; i--) {
+  for (int i = 1 << 24; i > 0; i--) {
     oom_test_last_ptr = noopt(new NewHandlerHelper(oom_test_last_ptr));
     ASSERT_NE(oom_test_last_ptr, nullptr);
     if (saw_new_handler_runs) {
@@ -1302,9 +1447,9 @@ TEST(TCMallocTest, AllTests) {
   {
     // We use new-hook and delete-hook to verify we actually called the
     // tcmalloc version of these routines, and not the libc version.
-    SetNewHook();      // defined as part of MAKE_HOOK_CALLBACK, above
-    SetDeleteHook();   // ditto
-    tcmalloc::Cleanup unhook([] () {
+    SetNewHook();     // defined as part of MAKE_HOOK_CALLBACK, above
+    SetDeleteHook();  // ditto
+    tcmalloc::Cleanup unhook([]() {
       // Reset the hooks to what they used to be.  These are all
       // defined as part of MAKE_HOOK_CALLBACK, above.
       ResetNewHook();
@@ -1312,13 +1457,27 @@ TEST(TCMallocTest, AllTests) {
     });
 
     void* p1 = noopt(malloc)(10);
-    ASSERT_NE(p1, nullptr);    // force use of this variable
+    ASSERT_NE(p1, nullptr);  // force use of this variable
     VerifyNewHookWasCalled();
     // Also test the non-standard tc_malloc_size
     size_t actual_p1_size = tc_malloc_size(p1);
     ASSERT_GE(actual_p1_size, 10);
-    ASSERT_LT(actual_p1_size, 100000);   // a reasonable upper-bound, I think
+    ASSERT_LT(actual_p1_size, 100000);  // a reasonable upper-bound, I think
     free(p1);
+    VerifyDeleteHookWasCalled();
+
+    p1 = noopt(malloc)(10);
+    ASSERT_NE(p1, nullptr);
+    VerifyNewHookWasCalled();
+    tc_free_sized(p1, 10);
+    VerifyDeleteHookWasCalled();
+
+    // sadly windows stuff lacks aligned_alloc
+    // (https://learn.microsoft.com/en-us/cpp/standard-library/cstdlib?view=msvc-170#remarks-6)
+    p1 = noopt(tc_memalign)(1, 10);
+    ASSERT_NE(p1, nullptr);
+    VerifyNewHookWasCalled();
+    tc_free_aligned_sized(p1, 1, 10);
     VerifyDeleteHookWasCalled();
 
     p1 = tc_malloc_skip_new_handler(10);
@@ -1337,7 +1496,7 @@ TEST(TCMallocTest, AllTests) {
     ASSERT_NE(p1, nullptr);
     VerifyNewHookWasCalled();
     VerifyDeleteHookWasCalled();
-    cfree(p1);  // synonym for free
+    free(p1);
     VerifyDeleteHookWasCalled();
 
     if (kOSSupportsMemalign) {
@@ -1441,14 +1600,14 @@ TEST(TCMallocTest, AllTests) {
     delete[] poveraligned;
     VerifyDeleteHookWasCalled();
 
-    poveraligned = noopt(new(std::nothrow) overaligned_type);
+    poveraligned = noopt(new (std::nothrow) overaligned_type);
     ASSERT_NE(poveraligned, nullptr);
     ASSERT_EQ((((size_t)poveraligned) % kOveralignment), 0);
     VerifyNewHookWasCalled();
     delete poveraligned;
     VerifyDeleteHookWasCalled();
 
-    poveraligned = noopt(new(std::nothrow) overaligned_type[10]);
+    poveraligned = noopt(new (std::nothrow) overaligned_type[10]);
     ASSERT_NE(poveraligned, nullptr);
     ASSERT_EQ((((size_t)poveraligned) % kOveralignment), 0);
     VerifyNewHookWasCalled();
@@ -1512,12 +1671,12 @@ TEST(TCMallocTest, AllTests) {
   TestCalloc(0, 0, true);
   TestCalloc(0, 1, true);
   TestCalloc(1, 1, true);
-  TestCalloc(1<<10, 0, true);
-  TestCalloc(1<<20, 0, true);
-  TestCalloc(0, 1<<10, true);
-  TestCalloc(0, 1<<20, true);
-  TestCalloc(1<<20, 2, true);
-  TestCalloc(2, 1<<20, true);
+  TestCalloc(1 << 10, 0, true);
+  TestCalloc(1 << 20, 0, true);
+  TestCalloc(0, 1 << 10, true);
+  TestCalloc(0, 1 << 20, true);
+  TestCalloc(1 << 20, 2, true);
+  TestCalloc(2, 1 << 20, true);
   TestCalloc(1000, 1000, true);
 
   TestCalloc(kMaxSize, 2, false);
@@ -1531,19 +1690,19 @@ TEST(TCMallocTest, AllTests) {
   // Do the memory intensive tests after threads are done, since exhausting
   // the available address space can make pthread_create to fail.
 
-  // Check that huge allocations fail with NULL instead of crashing
+  // Check that huge allocations fail with nullptr instead of crashing
   printf("Testing huge allocations\n");
   TestHugeAllocations(&rnd);
 
-  // Check that large allocations fail with NULL instead of crashing
+  // Check that large allocations fail with nullptr instead of crashing
   //
   // debug allocation takes forever for huge allocs
   if (!TestingPortal::Get()->IsDebuggingMalloc()) {
     constexpr NumericProperty kHeapLimitMB{"tcmalloc.heap_limit_mb"};
     printf("Testing out of memory\n");
-    tcmalloc::Cleanup cleanup_limit = kHeapLimitMB.Override(1<<10); // 1 gig. Note, this is in megs.
+    tcmalloc::Cleanup cleanup_limit = kHeapLimitMB.Override(1 << 10);  // 1 gig. Note, this is in megs.
     // Don't exercise more than 1 gig, no need to.
-    for (int s = 0; ; s += (10<<20)) {
+    for (int s = 0;; s += (10 << 20)) {
       void* large_object = rnd.alloc(s);
       if (large_object == nullptr) {
         break;
@@ -1562,7 +1721,7 @@ TEST(TCMallocTest, EmergencyMalloc) {
 
   SetNewHook();
   SetDeleteHook();
-  tcmalloc::Cleanup unhook([] () {
+  tcmalloc::Cleanup unhook([]() {
     ResetNewHook();
     ResetDeleteHook();
   });
@@ -1572,25 +1731,26 @@ TEST(TCMallocTest, EmergencyMalloc) {
 
   VerifyNewHookWasCalled();
 
-  portal->WithEmergencyMallocEnabled([&] () {
-    p2 = noopt(malloc)(32);
-  });
+  portal->WithEmergencyMallocEnabled([&]() { p2 = noopt(malloc)(32); });
 
   ASSERT_NE(p2, nullptr);
 
   // Emergency malloc doesn't call hook
   ASSERT_EQ(g_NewHook_calls, 0);
 
-  // Emergency malloc doesn't return pointers recognized by MallocExtension
+  // Emergency malloc pointers are recognized by MallocExtension::GetOwnership
   ASSERT_EQ(MallocExtension::instance()->GetOwnership(p1), MallocExtension::kOwned);
-  ASSERT_EQ(MallocExtension::instance()->GetOwnership(p2), MallocExtension::kNotOwned);
+  ASSERT_EQ(MallocExtension::instance()->GetOwnership(p2), MallocExtension::kOwned);
+
+  EXPECT_FALSE(portal->IsEmergencyPtr(p1));
+  EXPECT_TRUE(portal->IsEmergencyPtr(p2));
 
   // Emergency malloc automagically does the right thing for free()
   // calls and doesn't invoke hooks.
-  tc_free(p2);
+  free(p2);
   ASSERT_EQ(g_DeleteHook_calls, 0);
 
-  tc_free(p1);
+  free(p1);
   VerifyDeleteHookWasCalled();
 }
 
@@ -1606,7 +1766,7 @@ TEST(TCMallocTest, EmergencyMallocNoHook) {
   void* p3 = nullptr;
   void* p4 = nullptr;
 
-  portal->WithEmergencyMallocEnabled([&] () {
+  portal->WithEmergencyMallocEnabled([&]() {
     p2 = noopt(malloc)(32);
     for (int i = 11; i < 999; i++) {
       tc_free(p3);
@@ -1619,28 +1779,95 @@ TEST(TCMallocTest, EmergencyMallocNoHook) {
   ASSERT_NE(p3, nullptr);
   ASSERT_NE(p4, nullptr);
 
-  // Emergency malloc doesn't return pointers recognized by MallocExtension
+  // Emergency malloc pointers are recognized by MallocExtension::GetOwnership
   ASSERT_EQ(MallocExtension::instance()->GetOwnership(p1), MallocExtension::kOwned);
-  ASSERT_EQ(MallocExtension::instance()->GetOwnership(p2), MallocExtension::kNotOwned);
-  ASSERT_EQ(MallocExtension::instance()->GetOwnership(p3), MallocExtension::kNotOwned);
-  ASSERT_EQ(MallocExtension::instance()->GetOwnership(p4), MallocExtension::kNotOwned);
+  ASSERT_EQ(MallocExtension::instance()->GetOwnership(p2), MallocExtension::kOwned);
+  ASSERT_EQ(MallocExtension::instance()->GetOwnership(p3), MallocExtension::kOwned);
+  ASSERT_EQ(MallocExtension::instance()->GetOwnership(p4), MallocExtension::kOwned);
+
+  EXPECT_FALSE(portal->IsEmergencyPtr(p1));
+  EXPECT_TRUE(portal->IsEmergencyPtr(p2));
+  EXPECT_TRUE(portal->IsEmergencyPtr(p3));
+  EXPECT_TRUE(portal->IsEmergencyPtr(p4));
 
   SetNewHook();
   SetDeleteHook();
-  tcmalloc::Cleanup unhook([] () {
+  tcmalloc::Cleanup unhook([]() {
     ResetNewHook();
     ResetDeleteHook();
   });
 
   // Emergency malloc automagically does the right thing for free()
   // calls and doesn't invoke hooks.
-  tc_free(p4);
-  tc_free(p3);
-  tc_free(p2);
+  free(p4);
+  free(p3);
+  free(p2);
   ASSERT_EQ(g_DeleteHook_calls, 0);
 
-  tc_free(p1);
+  free(p1);
   VerifyDeleteHookWasCalled();
+}
+
+TEST(TCMallocTest, ReallocVsFreeSized) {
+  constexpr size_t kLargerSize = 256;
+  constexpr size_t kSmallerSize = 160;
+
+  void* p = noopt(realloc)(nullptr, kLargerSize);
+  ASSERT_NE(p, nullptr);
+  p = noopt(realloc)(p, kSmallerSize);
+  ASSERT_NE(p, nullptr);
+
+  // what we want to test is this: tc_free_sized(p, 80);
+  // But how do we detect it's failure. So lets check explicitly
+
+  void* p2 = noopt(malloc)(kSmallerSize);
+  uint32_t small_size_class = TestingPortal::Get()->GetSizeClass(p2);
+  free(p2);
+
+  uint32_t realloced_size_class = TestingPortal::Get()->GetSizeClass(p);
+
+  ASSERT_EQ(realloced_size_class, small_size_class);
+
+  free(p);
+}
+
+TEST(TCMallocTest, ReallocOnInvalidPointer) {
+  if (TestingPortal::Get()->IsDebuggingMalloc()) {
+    return;
+  }
+
+  static uint64_t mock_object[2] = {0x3955fe9622eede93, 0x42};
+  static bool invalid_free_called;
+  static bool invalid_get_size_called;
+
+  auto invalid_free = +[](void* ptr) {
+    EXPECT_EQ(ptr, mock_object);
+    invalid_free_called = true;
+  };
+
+  auto invalid_get_size = +[](const void* ptr) -> size_t {
+    EXPECT_EQ(ptr, mock_object);
+    invalid_get_size_called = true;
+    return sizeof(mock_object[0]);
+  };
+
+  invalid_free_called = false;
+  invalid_get_size_called = false;
+
+  void* p = TestingPortal::Get()->RunReallocWithCallback(mock_object, 128, invalid_free, invalid_get_size);
+
+  ASSERT_NE(p, nullptr);
+  ASSERT_EQ(MallocExtension::instance()->GetAllocatedSize(p), 128);
+  ASSERT_NE(p, mock_object);
+  ASSERT_TRUE(invalid_free_called);
+  ASSERT_TRUE(invalid_get_size_called);
+
+  // Verify that the contents of the object are preserved
+  ASSERT_EQ(memcmp(p, &mock_object[0], sizeof(mock_object[0])), 0);
+  // And that the second word of mock_object is not touched when copying
+  ASSERT_NE(memcmp(p, &mock_object[1], sizeof(mock_object[1])), 0);
+
+  free(p);
 }
 
 TEST(TCMallocTest, Version) {
@@ -1654,44 +1881,6 @@ TEST(TCMallocTest, Version) {
   ASSERT_LT(used, sizeof(mmp));
   ASSERT_EQ(strcmp(TC_VERSION_STRING, human_version), 0);
 }
-
-#ifdef _WIN32
-#undef environ
-#undef execle
-#define environ _environ
-#define execle tcmalloc_windows_execle
-
-static intptr_t tcmalloc_windows_execle(const char* pathname, const char* argv0, const char* nl, const char* envp[]) {
-  CHECK_EQ(nl, nullptr);
-  const char* args[2] = {argv0, nullptr};
-  MallocExtension::instance()->MarkThreadIdle();
-  MallocExtension::instance()->ReleaseFreeMemory();
-  // MS's CRT _execle while kinda "similar" to real thing, is totally
-  // wrong (!!!). So we simulate it by doing spawn with _P_WAIT and
-  // exiting with status that we got.
-  intptr_t rv =  _spawnve(_P_WAIT, pathname, args, envp);
-  if (rv < 0) {
-    perror("_spawnve");
-    abort();
-  }
-  _exit(static_cast<int>(rv));
-}
-#endif  // _WIN32
-
-// POSIX standard oddly requires users to define environ variable
-// themselves. 3 of 3 bsd-derived systems I tested on actually
-// don't bother having environ in their headers. Relevant ticket has
-// been closed as "won't fix" in FreeBSD ticket tracker:
-// https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=238672
-//
-// Just in case, we wrap this declaration with ifdef, so that if
-// anyone has environ as macro (see windows case above), we won't be
-// breaking anything.
-#if !defined(environ)
-extern "C" {
-extern char** environ;
-}
-#endif
 
 struct EnvProperty {
   const char* const name;
@@ -1708,23 +1897,22 @@ struct EnvProperty {
   using override_set = std::vector<std::pair<std::string, std::string>>;
   using env_override_fn = std::function<void(override_set*)>;
 
-  static std::function<std::vector<const char*>()> DuplicateAndUpdateEnv(env_override_fn fn) {
-    return [fn] () {
-      override_set overrides;
-      fn(&overrides);
-      return DoDuplicateAndUpdateEnv(std::move(overrides));
-    };
+  static std::vector<const char*> DuplicateAndUpdateEnv(env_override_fn fn) {
+    override_set overrides;
+    fn(&overrides);
+    return DoDuplicateAndUpdateEnv(std::move(overrides));
   }
 
   static std::vector<const char*> DoDuplicateAndUpdateEnv(override_set overrides) {
     std::vector<const char*> vec;
 
-    for (const char* const *p = environ; *p; p++) {
+    for (const char* const* p = environ; *p; p++) {
       std::string_view k_and_v{*p};
       auto pos = k_and_v.find('=');
       CHECK(pos != std::string_view::npos);
       std::string_view k = k_and_v.substr(0, pos);
-      int i = overrides.size() - 1;;
+      int i = overrides.size() - 1;
+      ;
       for (; i >= 0; i--) {
         if (overrides[i].first == k) {
           break;
@@ -1765,6 +1953,110 @@ struct EnvProperty {
   }
 };
 
+static const char* argv0;  // set in HandleVariableRuns
+
+#ifndef _WIN32
+// Everything non-windows we assume sufficiently POSIX-ish
+static void ReSpawnWithEnv(EnvProperty::env_override_fn env_override) {
+  std::vector<const char*> env = EnvProperty::DuplicateAndUpdateEnv(env_override);
+  char* const child_argv[] = {const_cast<char*>(argv0), nullptr};
+  pid_t pid;
+  int rv = posix_spawn(&pid, argv0, nullptr, nullptr, child_argv, const_cast<char**>(env.data()));
+  if (rv != 0) {
+    errno = rv;
+    perror("posix_spawn");
+    abort();
+  }
+
+  // parent
+  int status = -1;
+  pid_t wait_rv;
+  do {
+    wait_rv = waitpid(pid, &status, 0);
+  } while (wait_rv < 0 && errno == EINTR);
+
+  if (wait_rv < 0) {
+    perror("waitpid");
+    abort();
+  }
+
+  CHECK_EQ(wait_rv, pid);
+  int exit_status = WEXITSTATUS(status);
+  if (!WIFEXITED(status) || exit_status != 0) {
+    printf("sub-process run failed with status = %d.\n", status);
+    if (WIFEXITED(status)) {
+      exit(exit_status);
+    }
+    exit(1);
+  }
+}
+#else
+// Windows spawning codes
+static void ReSpawnWithEnv(EnvProperty::env_override_fn env_override) {
+  std::vector<const char*> env = EnvProperty::DuplicateAndUpdateEnv(env_override);
+
+  // For windows CreateProcessA environment needs to be converted to
+  // environment block. Which is just a successive ASCIIZ strings
+  // terminated by \0 (blank string). So we convert our vector
+  // environment entries to this format.
+  env.pop_back();  // last element is nullptr
+
+  std::vector<std::string_view> env_views;
+  env_views.reserve(env.size());
+  size_t total_size = 0;
+  for (const char* s : env) {
+    env_views.push_back(s);
+    total_size += env_views.rbegin()->size() + 1;
+  }
+  total_size++;  // account for final empty string
+
+  std::unique_ptr<char[]> env_block = std::make_unique<char[]>(total_size);
+  char* env_block_p = env_block.get();
+  for (std::string_view s : env_views) {
+    env_block_p = std::copy(s.begin(), s.end(), env_block_p);
+    *env_block_p++ = '\0';
+  }
+  *env_block_p++ = '\0';
+  CHECK_EQ(env_block_p, &(env_block[total_size]));
+
+  fflush(stdout);
+  fflush(stderr);
+
+  STARTUPINFOA si;
+  PROCESS_INFORMATION pi;
+
+  memset(&si, 0, sizeof(si));
+  si.cb = sizeof(si);
+  memset(&pi, 0, sizeof(pi));
+
+  if (!CreateProcessA(argv0,
+                      nullptr,  // command line. nullptr implies just argv0
+                      nullptr,  // process attributes
+                      nullptr,  // thread attributes
+                      TRUE,     // InheritHandles
+                      0,        // creation flags
+                      env_block.get(),
+                      nullptr,  // current directory
+                      &si, &pi)) {
+    printf("CreateProcessA failed with error code: %x\n", (unsigned)GetLastError());
+    abort();
+  }
+
+  WaitForSingleObject(pi.hProcess, INFINITE);
+
+  DWORD exit_code;
+  GetExitCodeProcess(pi.hProcess, &exit_code);
+
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+
+  if (exit_code != 0) {
+    printf("sub-process run failed with status = %d\n", (int)exit_code);
+    exit((int)exit_code);
+  }
+}
+#endif  // _WIN32
+
 // We want to run tests with several runtime configuration tweaks. For
 // improved test coverage. Previously we had shell script driving
 // this, now we handle this by exec-ing just at the end of all tests.
@@ -1786,86 +2078,231 @@ struct EnvProperty {
 //
 // * TCMALLOC_ENABLE_SIZED_DELETE = t (note, this one is no-op in most
 //     common builds)
-std::function<std::vector<const char*>()> PrepareEnv() {
-  static constexpr EnvProperty kUpdateNoEnv{"TCMALLOC_UNITTEST_ENV_UPDATE_NO"};
+void HandleVariableRuns(int argc, char** argv) {
+  if (argc != 1) {
+    return;
+  }
+
+  argv0 = argv[0];
+
+  static constexpr EnvProperty kMarker{"TCMALLOC_UNITTEST_MARKER"};
   static constexpr EnvProperty kTransferNumObjEnv{"TCMALLOC_TRANSFER_NUM_OBJ"};
   static constexpr EnvProperty kAggressiveDecommitEnv{"TCMALLOC_AGGRESSIVE_DECOMMIT"};
   static constexpr EnvProperty kHeapLimitEnv{"TCMALLOC_HEAP_LIMIT_MB"};
   static constexpr EnvProperty kEnableSizedDeleteEnv{"TCMALLOC_ENABLE_SIZED_DELETE"};
 
-  std::string_view testno = kUpdateNoEnv.Get();
+  if (!kMarker.Get().empty()) {
+    return;  // We're unitttest child
+  }
+
   using override_set = EnvProperty::override_set;
 
-  if (testno == "") {
-    return EnvProperty::DuplicateAndUpdateEnv([] (override_set* overrides) {
-      kTransferNumObjEnv.SetAndPrint(overrides, "40");
-      kUpdateNoEnv.Set(overrides, "1");
-    });
-  }
-  if (testno == "1") {
-    return EnvProperty::DuplicateAndUpdateEnv([] (override_set* overrides) {
-      kTransferNumObjEnv.SetAndPrint(overrides, "4096");
-      kUpdateNoEnv.Set(overrides, "2");
-    });
-  }
-  if (testno == "2") {
-    return EnvProperty::DuplicateAndUpdateEnv([] (override_set* overrides) {
-      kTransferNumObjEnv.Set(overrides, "");
-      kAggressiveDecommitEnv.SetAndPrint(overrides, "t");
-      kUpdateNoEnv.Set(overrides, "3");
-    });
-  }
-  if (testno == "3") {
-    return EnvProperty::DuplicateAndUpdateEnv([] (override_set* overrides) {
-      kAggressiveDecommitEnv.Set(overrides, "");
-      kHeapLimitEnv.SetAndPrint(overrides, "512");
-      kUpdateNoEnv.Set(overrides, "4");
-    });
-  }
-  if (testno == "4") {
-    return EnvProperty::DuplicateAndUpdateEnv([] (override_set* overrides) {
-      kHeapLimitEnv.Set(overrides, "");
-      kEnableSizedDeleteEnv.SetAndPrint(overrides, "t");
-      kUpdateNoEnv.Set(overrides, "5");
-    });
-  }
-  if (testno == "5") {
-    return {};
-  }
-  printf("Unknown %s: %.*s\n", kUpdateNoEnv.name, static_cast<int>(testno.size()), testno.data());
-  abort();
+  ReSpawnWithEnv([](override_set* overrides) { kMarker.Set(overrides, "_"); });
+
+  ReSpawnWithEnv([](override_set* overrides) {
+    kTransferNumObjEnv.SetAndPrint(overrides, "40");
+    kMarker.Set(overrides, "_");
+  });
+
+  ReSpawnWithEnv([](override_set* overrides) {
+    kTransferNumObjEnv.SetAndPrint(overrides, "4096");
+    kMarker.Set(overrides, "_");
+  });
+
+  ReSpawnWithEnv([](override_set* overrides) {
+    kTransferNumObjEnv.Set(overrides, "");
+    kAggressiveDecommitEnv.SetAndPrint(overrides, "t");
+    kMarker.Set(overrides, "_");
+  });
+
+  ReSpawnWithEnv([](override_set* overrides) {
+    kAggressiveDecommitEnv.Set(overrides, "");
+    kHeapLimitEnv.SetAndPrint(overrides, "512");
+    kMarker.Set(overrides, "_");
+  });
+
+  ReSpawnWithEnv([](override_set* overrides) {
+    kHeapLimitEnv.Set(overrides, "");
+    kEnableSizedDeleteEnv.SetAndPrint(overrides, "t");
+    kMarker.Set(overrides, "_");
+  });
+
+  exit(0);
 }
 
-std::function<void()> SetupExec(int argc, char** argv) {
-  if (argc != 1) {
-    return {};
+#ifdef HAVE_FORK_TESTING_SUPPORT
+namespace fork_torture {
+
+// Fork torture testing.
+//
+// Basic idea is to enable x86 single-stepping mode. And have signal
+// handler for SIGTRAP wake up a helper thread. That helper thread
+// forks and runs some malloc activities in the child.
+//
+// We also setup cpu mask with exactly one cpu and have helper thread
+// on real-time scheduling policy. This ensures that whenever helper
+// thread runs forking, we can unblock main thread, but main thread
+// will only run when helper thread is blocked on some lock.
+//
+// Intended outcome is to exercise fork in multithreaded programs on
+// roughly every possible opportunity.
+//
+// We also add a small optimization of only really stopping on
+// instructions immediately after instruction with LOCK
+// prefix. I.e. after some locking operation is complete.
+//
+// This is Linux- and x86-64-specific for simplicity.
+
+// single_step_req is waited by the helper thread and posted by main
+// thread from single-step signal handler.
+sem_t single_step_req;
+// single_step_ack is waited by the main thread and posted by the
+// helper thread.
+sem_t single_step_ack;
+
+// in_fork is a flag set iff helper thread is running the forking activity.
+bool in_fork;
+
+uint64_t num_forks;
+uint64_t num_instructions;
+
+void xsem_wait(sem_t* sem) {
+  while (sem_wait(sem) < 0) {
+    CHECK(errno == EINTR);
   }
-
-  std::function<std::vector<const char*>()> env_fn = PrepareEnv();
-  if (!env_fn) {
-    return env_fn;
-  }
-
-  const char* program_name = strdup(argv[0]);
-  // printf("program_name = %s\n", program_name);
-
-  return [program_name, env_fn] () {
-    std::vector<const char*> vec = env_fn();
-
-    // printf("pre-exec:\n");
-    // for (const char* k_and_v : vec) {
-    //   if (k_and_v) {
-    //     printf("%s\n", k_and_v);
-    //   }
-    // }
-    // printf("\n");
-
-    CHECK_EQ(execle(program_name, program_name, nullptr, vec.data()), 0);
-  };
 }
+
+tcmalloc::Cleanup<std::function<void()>> setup_fork_testing(int* argc, char*** argv) {
+  bool torture_asked = (*argc > 1 && (*argv)[1] == std::string_view("--with-fork-torture"));
+  std::optional<tcmalloc::SingleStepper*> maybe_stepper = tcmalloc::SingleStepper::Get();
+  if (torture_asked && !maybe_stepper) {
+    printf("asked to enable fork torture but seeing unsupported single stepper\n");
+    torture_asked = false;
+  }
+  if (!torture_asked) {
+    printf("Not enabling fork torture\n");
+    return tcmalloc::Cleanup(std::function<void()>([]() {}));
+  }
+  printf("Enabling fork torturing!!!!\n");
+
+  CHECK(sem_init(&single_step_req, 0, 0) == 0);
+  CHECK(sem_init(&single_step_ack, 0, 0) == 0);
+
+  // First, we set cpu affinity mask to only core 0. It helps
+  // performance, but mostly it is required so that main thread never
+  // runs when real-time helper thread is runnable.
+  {
+    cpu_set_t mask;
+    memset(&mask, 0, sizeof(mask));
+    CPU_SET(0, &mask);
+    CHECK(sched_setaffinity(0, sizeof(mask), &mask) == 0);
+  }
+
+  std::thread* t = new std::thread([]() {
+    // Helper thread first makes itself real-time.
+    struct sched_param p;
+    memset(&p, 0, sizeof(p));
+    p.sched_priority = 1;
+    CHECK(sched_setscheduler(0, SCHED_FIFO, &p) == 0);
+
+    // And then signals its readiness.
+    sem_post(&single_step_ack);
+
+    MallocExtension::instance()->MarkThreadIdle();
+
+    constexpr int kPeriod = 1 << 10;
+    int cnt = kPeriod;
+
+    while (true) {
+      xsem_wait(&single_step_req);
+      // Lets print something every few iterations to help us see if
+      // progress is being made.
+      if (--cnt <= 0) {
+        write(2, "$", 1);
+        cnt = kPeriod;
+      }
+
+      // Once we're about to fork, we need to flag "in_fork" mode and
+      // unblock main thread.
+      in_fork = true;
+      sem_post(&single_step_ack);
+
+      int child = fork();
+      CHECK(child >= 0);
+      if (child == 0) {
+        // Child runs some mallocs and exits.
+        (::operator delete)((::operator new)(32));
+        (::operator delete)((::operator new)(1024));
+        (::operator delete)((::operator new)(2 << 20));
+        _exit(0);
+      }
+
+      // Parent asserts that child exited cleanly.
+      int status = 0;
+      int ret = waitpid(child, &status, 0);
+      CHECK(ret == child);
+      CHECK(status == 0);
+
+      // And we un-mark in_fork mode, so that main thread continues to
+      // cooperation via sem_{post/wait} on single_step_{req,ack}
+      // semaphores.
+      num_forks++;
+      in_fork = false;
+    }
+  });
+  (void)t;  // leak
+  xsem_wait(&single_step_ack);
+
+  MallocExtension::instance()->MarkThreadIdle();
+
+  maybe_stepper.value()->Start(+[](void* _uc, tcmalloc::SingleStepper* stepper) -> void {
+    num_instructions++;
+    if (in_fork) {
+      return;
+    }
+
+    // Optimize by only triggering forking after some locking
+    // instruction.
+    static __thread bool last_was_lock;
+    if (!last_was_lock) {
+      last_was_lock = stepper->IsAtLockInstruction(_uc);
+      return;
+    }
+    last_was_lock = false;
+
+    sem_post(&single_step_req);
+    xsem_wait(&single_step_ack);
+  });
+
+  // This is a flag for a test that is not compatible with
+  // single-stepping. NewHandler test doesn't work because it enables
+  // oom simulation at some point which, naturally, crashes the forked
+  // child.
+  running_fork_testing = true;
+
+  return tcmalloc::Cleanup(std::function<void()>([]() {
+    printf("num_instructions: %llu\n", (unsigned long long)num_instructions);
+    tcmalloc::SingleStepper::Get().value()->Stop();
+    while (*const_cast<volatile bool*>(&in_fork)) {
+      // no-op
+    }
+    // In the clean up, we're ensuring that in_fork turns to false, so
+    // that fork/waitpid isn't stuck.
+    printf("Done with fork torturing! Number of forks performed: %lld\n", (long long)num_forks);
+  }));
+}
+}  // namespace fork_torture
+
+using fork_torture::setup_fork_testing;
+
+#else  // HAVE_FORK_TESTING_SUPPORT
+
+int setup_fork_testing(int* argc, char*** argv) { return 0; }
+
+#endif  // !HAVE_FORK_TESTING_SUPPORT
 
 int main(int argc, char** argv) {
-  std::function<void()> exec_fn = SetupExec(argc, argv);
+  HandleVariableRuns(argc, argv);
 
   if (TestingPortal::Get()->IsDebuggingMalloc()) {
     // return freed blocks to tcmalloc immediately
@@ -1882,14 +2319,11 @@ int main(int argc, char** argv) {
 
   testing::InitGoogleTest(&argc, argv);
 
+  auto fork_cleanup = setup_fork_testing(&argc, &argv);
+  (void)fork_cleanup;
+
   int err_code = RUN_ALL_TESTS();
-  if (err_code || !exec_fn) {
+  if (err_code) {
     return err_code;
   }
-
-  // if exec_fn is not empty and we've passed tests so far, lets try
-  // to continue testing by updating environment variables and
-  // self-execing.
-  exec_fn();
-  printf("Shouldn't be reachable\n");
 }

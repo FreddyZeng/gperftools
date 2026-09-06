@@ -44,6 +44,7 @@ def dwm!(d)
     d.field "sc_ip", "Linux/ia64"
     d.field "__pc", "Linux/loongarch64"
     d.field "pc", "Linux/{mips,aarch64}"
+    d.field "sc_pc", "Linux/alpha"
     d.ifdef :PT_NIP, "uc_regs->gregs[PT_NIP]", "Linux/ppc"
     d.ifdef :PT_NIP, "gp_regs[PT_NIP]", "Linux/ppc"
     d.ifdef :REG_PC, "__gregs[REG_PC]", "Linux/riscv"
@@ -159,8 +160,8 @@ HERE
 
 // #{comment}
 template <class U, class P, class = void>
-struct get_#{fingerprint} : public P {
-};#{maybe_open_ifdef}
+struct get_#{fingerprint} : public P {};
+#{maybe_open_ifdef}
 template <class U, class P>
 struct get_#{fingerprint}<U, P, void_t<decltype(#{tmpl["((U*){})"]})>> : public P {
   static void* Get(const U* uc) {

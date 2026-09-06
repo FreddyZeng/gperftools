@@ -4,12 +4,12 @@
 # make sure we're interpreted by some minimal autoconf
 AC_PREREQ([2.69])
 
-AC_INIT([gperftools],[2.15.90],[gperftools@googlegroups.com])
+AC_INIT([gperftools],[2.18.90],[gperftools@googlegroups.com])
 # Update this value for every release!  (A:B:C will map to foo.so.(A-C).C.B)
 # http://www.gnu.org/software/libtool/manual/html_node/Updating-version-info.html
-TCMALLOC_SO_VERSION=9:17:5
-PROFILER_SO_VERSION=5:12:5
-TCMALLOC_AND_PROFILER_SO_VERSION=10:12:6
+TCMALLOC_SO_VERSION=10:6:6
+PROFILER_SO_VERSION=5:20:5
+TCMALLOC_AND_PROFILER_SO_VERSION=11:6:7
 
 AC_SUBST(TCMALLOC_SO_VERSION)
 AC_SUBST(PROFILER_SO_VERSION)
@@ -20,39 +20,34 @@ AC_SUBST(TCMALLOC_AND_PROFILER_SO_VERSION)
 AC_CONFIG_SRCDIR(README)
 AC_CONFIG_MACRO_DIR([m4])
 AC_CANONICAL_HOST
-AM_INIT_AUTOMAKE([dist-zip foreign tar-ustar])
+AM_INIT_AUTOMAKE([dist-zip dist-xz foreign tar-ustar nostdinc])
 AC_CONFIG_HEADERS([src/config.h])
 
 AM_MAINTAINER_MODE()
-# Export the version information (for tc_version and friends)
-TC_VERSION_MAJOR=`expr "$PACKAGE_VERSION" : '\([[0-9]]*\)'`
-TC_VERSION_MINOR=`expr "$PACKAGE_VERSION" : '[[0-9]]*\.\([[0-9]]*\)'`
-TC_VERSION_PATCH=`expr "$PACKAGE_VERSION" : '[[0-9]]*\.[[0-9]]*\(.*\)$'`
-AC_SUBST(TC_VERSION_MAJOR)
-AC_SUBST(TC_VERSION_MINOR)
-AC_SUBST(TC_VERSION_PATCH)
-AC_SUBST(PACKAGE_STRING)
 
-# The user can choose not to compile in the heap-profiler, the
-# heap-checker, or the cpu-profiler.  There's also the possibility
-# for a 'fully minimal' compile, which leaves out the stacktrace
-# code as well.  By default, we include all of these that the
-# target system supports.
+# Checks for programs.
+AC_PROG_CXX
+AC_PROG_CC
+AM_PROG_AS
+AC_LANG([C++])
+AM_CONDITIONAL(GCC, test "$GCC" = yes)   # let the Makefile know if we're gcc
+
+AX_CXX_COMPILE_STDCXX(17, ext, mandatory)
+
+# The user can choose not to compile in the heap-profiler, , or the
+# cpu-profiler.  There's also the possibility for a 'fully minimal'
+# compile, which leaves out the stacktrace code as well.  By default,
+# we include all of these that the target system supports.
 default_enable_cpu_profiler=yes
 default_enable_heap_profiler=yes
-# heap checker is Linux-only.
-default_enable_heap_checker=no
-heap_checker_supported=no
 default_enable_debugalloc=yes
 default_enable_minimal=no
 default_tcmalloc_alignment=16
-heap_checker_is_default=no
 need_nanosleep=yes   # Used later, to decide if to run ACX_NANOSLEEP
 case "$host" in
    *-mingw*) default_enable_minimal=yes; default_enable_debugalloc=no;
              need_nanosleep=no;;
    *-cygwin*) default_enable_cpu_profiler=no;;
-   *-linux*) default_enable_heap_checker=yes; heap_checker_supported=yes;;
 esac
 
 # Currently only backtrace works on s390 and OSX.
@@ -66,6 +61,38 @@ return 1
                    default_enable_backtrace=yes],
                   [default_enable_libunwind=yes
                    default_enable_backtrace=no])
+
+AC_ARG_ENABLE([aw-backtrace],
+              [AS_HELP_STRING([--{enable,disable}-aw-backtrace],
+                              [build with aw-backtrace (default on Linux/amd64 or arm64)])],
+              [enable_aw_backtrace="$enableval"],
+              [enable_aw_backtrace=maybe])
+
+# modern Linux and x86-64 or aarch64 for now
+AS_IF([test "$enable_aw_backtrace" = maybe],
+[save_CXXFLAGS="$CXXFLAGS"
+# aw-backtrace itself is built as C++20 (see libaw_backtrace_la_CXXFLAGS in
+# Makefile.am) even though the rest of gperftools targets C++17. Compile
+# this probe as C++20 too, so we don't default to aw-backtrace on a
+# toolchain that has _dl_find_object but can't actually compile it.
+CXXFLAGS="$CXXFLAGS -std=c++20"
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([
+#include <dlfcn.h>
+], [
+#if (!__x86_64__ && !__aarch64__) || !__linux__
+#error not defaulting to aw-backtrace here yet
+#endif
+struct dl_find_object dlfo;
+auto res = _dl_find_object(reinterpret_cast<void*>(&_dl_find_object), &dlfo);
+])],
+                  [enable_aw_backtrace=yes],
+                  [enable_aw_backtrace=no])
+CXXFLAGS="$save_CXXFLAGS"])
+
+AS_IF([test x"$enable_aw_backtrace" = xyes],
+      [AC_MSG_NOTICE([Will build with aw-backtrace])
+       AC_DEFINE(BUILD_WITH_AW_BACKTRACE, 1, [If we're building with aw-backtrace])])
+AM_CONDITIONAL(ENABLE_AW_BACKTRACE, [test "x$enable_aw_backtrace" = xyes])
 
 # Disable libunwind linking on ppc64 by default.
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM(, [return __PPC64__])],
@@ -84,11 +111,6 @@ AC_ARG_ENABLE([heap-profiler],
                               [do not build the heap profiler])],
               [],
               [enable_heap_profiler="$default_enable_heap_profiler"])
-AC_ARG_ENABLE([heap-checker],
-              [AS_HELP_STRING([--disable-heap-checker],
-                              [do not build the heap checker])],
-              [],
-              [enable_heap_checker="$default_enable_heap_checker"; heap_checker_is_default=yes])
 AC_ARG_ENABLE([debugalloc],
               [AS_HELP_STRING([--disable-debugalloc],
                               [do not build versions of libs with debugalloc])],
@@ -102,8 +124,12 @@ AC_ARG_ENABLE([minimal],
 if test "$enable_minimal" = yes; then
   enable_cpu_profiler=no
   enable_heap_profiler=no
-  enable_heap_checker=no
 fi
+AC_ARG_ENABLE([tests],
+              [AS_HELP_STRING([--disable-tests],
+                              [do not build or run tests])],
+              [enable_tests="$enableval"],
+              [enable_tests=yes])
 AC_ARG_ENABLE([stacktrace-via-backtrace],
               [AS_HELP_STRING([--enable-stacktrace-via-backtrace],
                               [enable use of backtrace() for stacktrace capturing (may deadlock)])],
@@ -163,42 +189,6 @@ case "$with_tcmalloc_alignment" in
        AC_MSG_WARN([${with_tcmalloc_alignment} bytes not supported, using default tcmalloc allocation alignment.])
 esac
 
-AS_IF([test "x$enable_heap_checker" = xyes],
-      [AS_IF([test "x$heap_checker_supported" = xno],
-             [AC_MSG_NOTICE([your system isn't Linux, and I won't build heap checker despite your request])]
-              enable_heap_checker=no)])
-
-dnl Heap checker is (and has always been) Linux-only, and also now
-dnl depends on clone support in libc.  Most Linux libc's do ship clone()
-dnl (includes glibc, musl and even bionic), but not all. So we check.
-AS_IF([test "x$enable_heap_checker" = xyes],
-      [AC_MSG_CHECKING([clone() support])
-      AC_LINK_IFELSE([AC_LANG_PROGRAM([[
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-
-#include <sched.h>
-
-static int fn(void *dummy) { return 0; }
-
-]],[[
-  char stk[16];
-  return clone(fn, stk, CLONE_VM|CLONE_FS|CLONE_FILES, 0);
-]])], [AC_MSG_RESULT([yes])], [ dnl clone not found
-  AC_MSG_RESULT([no])
-  enable_heap_checker=no
-  AS_IF([test "x$heap_checker_is_default" = xyes],
-        [AC_MSG_NOTICE([your Linux system won't have heap checker built due to missing clone() support])],
-        [AC_MSG_WARN([you requested heap checker built, but your libc doesn't have clone() support])])
-])])
-
-# Checks for programs.
-AC_PROG_CXX
-AC_LANG([C++])
-AM_CONDITIONAL(GCC, test "$GCC" = yes)   # let the Makefile know if we're gcc
-
-AX_CXX_COMPILE_STDCXX(17, ext, mandatory)
 
 LT_INIT
 
@@ -251,20 +241,14 @@ AC_MSG_RESULT($ac_cv___attribute__aligned_fn)
 
 
 # TODO(csilvers): we could remove a lot when WITH_CPU_PROFILER etc is "no".
-AC_CHECK_TYPES([struct mallinfo],,, [#include <malloc.h>])
-AC_CHECK_TYPES([struct mallinfo2],,, [#include <malloc.h>])
 AC_CHECK_FUNCS(sbrk)            # for tcmalloc to get memory
 AC_CHECK_FUNCS(geteuid)         # for turning off services when run as root
 AC_CHECK_HEADERS(features.h)    # for vdso_support.h, __GLIBC__ macros
 AC_CHECK_HEADERS(malloc.h)      # some systems define stuff there, others not
 AC_CHECK_HEADERS(glob.h)        # for heap-profile-table (cleaning up profiles)
-AC_CHECK_HEADERS(execinfo.h)    # for stacktrace? and heapchecker_unittest
-AC_CHECK_HEADERS(unwind.h)      # for stacktrace
+AC_CHECK_HEADERS(execinfo.h)    # for stacktrace
 AC_CHECK_HEADERS(sched.h)       # for being nice in our spinlock code
 AC_CHECK_HEADERS(sys/syscall.h)
-AC_CHECK_HEADERS(sys/socket.h)  # optional; for forking out to symbolizer
-AC_CHECK_HEADERS(sys/wait.h)    # optional; for forking out to symbolizer
-AC_CHECK_HEADERS(poll.h)        # optional; for forking out to symbolizer
 AC_CHECK_HEADERS(fcntl.h)       # for tcmalloc_unittest
 AC_CHECK_HEADERS(sys/cdefs.h)   # Where glibc defines __THROW
 
@@ -272,9 +256,6 @@ AC_CHECK_HEADERS(sys/ucontext.h)
 AC_CHECK_HEADERS(ucontext.h)
 AC_CHECK_HEADERS(cygwin/signal.h)        # ucontext on cywgin
 AC_CHECK_HEADERS(asm/ptrace.h)           # get ptrace macros, e.g. PT_NIP
-
-# check for socketpair, some system, such as QNX, need link in an socket library to use it
-AC_SEARCH_LIBS([socketpair], [socket])
 
 REGEX_LIBS=
 # "sufficiently unix" systems need regexec for unit tests
@@ -290,8 +271,7 @@ AC_SUBST(REGEX_LIBS)
 
 # We override a lot of memory allocation routines, not all of which are
 # standard.  For those the system doesn't declare, we'll declare ourselves.
-AC_CHECK_DECLS([cfree,
-                posix_memalign,
+AC_CHECK_DECLS([posix_memalign,
                 memalign,
                 valloc,
                 pvalloc],,,
@@ -299,18 +279,6 @@ AC_CHECK_DECLS([cfree,
                 #define _QNX_SOURCE 1
                 #include <stdlib.h>
                 #include <malloc.h>])
-
-if test "$ac_cv_type_struct_mallinfo" = yes; then
-  AC_SUBST(ac_cv_have_struct_mallinfo, 1)   # gperftools/tcmalloc.h needs this
-else
-  AC_SUBST(ac_cv_have_struct_mallinfo, 0)
-fi
-
-if test "$ac_cv_type_struct_mallinfo2" = yes; then
-  AC_SUBST(ac_cv_have_struct_mallinfo2, 1)   # gperftools/tcmalloc.h needs this
-else
-  AC_SUBST(ac_cv_have_struct_mallinfo2, 0)
-fi
 
 # We hardcode HAVE_MMAP to 1. There are no interesting systems anymore
 # without functional mmap. And our windows (except mingw) builds
@@ -341,30 +309,23 @@ AM_CONDITIONAL(ENABLE_STATIC, test "$enable_static" = yes)
 
 # We want to link in libunwind if it is enabled and exists.
 UNWIND_LIBS=
+UNWIND_PC_DEP=
 if test "$enable_libunwind" = yes; then
   AC_CHECK_HEADERS([libunwind.h],
                    [AC_CHECK_LIB(unwind, backtrace,
                      [UNWIND_LIBS=-lunwind
+                      UNWIND_PC_DEP=libunwind
                       AC_DEFINE([USE_LIBUNWIND], [1], [libunwind.h was found and is working])
                       will_use_libunwind=yes])])
 fi
 AC_SUBST(UNWIND_LIBS)
+AC_SUBST(UNWIND_PC_DEP)
 
 AC_ARG_ENABLE(frame_pointers,
               AS_HELP_STRING([--enable-frame-pointers],
                              [Add -fno-omit-frame-pointer to compile flags]),
 	      , enable_frame_pointers=no)
 AM_CONDITIONAL(ENABLE_FRAME_POINTERS, test "$enable_frame_pointers" = yes)
-
-AC_ARG_ENABLE([deprecated-pprof],
-              [AS_HELP_STRING([--disable-deprecated-pprof],
-                [do not install old deprecated and unmaintained bundled pprof
-(see github.com/google/pprof for supported version)])],
-              [enable_pprof="$enableval"],
-              [enable_pprof=yes])
-
-AM_CONDITIONAL(INSTALL_PPROF,
-               [test "x$enable_pprof" = xyes])
 
 AC_ARG_ENABLE([dynamic-sized-delete-support],
               [AS_HELP_STRING([--enable-dynamic-sized-delete-support],
@@ -437,14 +398,15 @@ AH_VERBATIM([__STDC_FORMAT_MACROS],
 # define __STDC_FORMAT_MACROS 1
 #endif])
 
-# Check if __environ is available (for GetenvBeforeMain)
-AC_MSG_CHECKING([for __environ])
-AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <unistd.h>],
-                                [char **env = __environ])],
-               [AC_DEFINE(HAVE___ENVIRON, 1,
-                          [Define to 1 if compiler supports __environ])
-                AC_MSG_RESULT([yes])],
-               [AC_MSG_RESULT([no])])
+AC_CACHE_CHECK([if target has functional __cxa_demangle],
+               [perftools_cv_have_cxa_demangle],
+               [AC_COMPILE_IFELSE([AC_LANG_PROGRAM(
+                    [[#include <cxxabi.h>]],
+                    [[&__cxxabiv1::__cxa_demangle]])],
+                  [perftools_cv_have_cxa_demangle=yes],
+                  [perftools_cv_have_cxa_demangle=no])])
+AS_IF([test "x$perftools_cv_have_cxa_demangle" = xyes],
+      [AC_DEFINE(HAVE_CXA_DEMANGLE, 1, [Whether <cxxabi.h> contains __cxxabiv1::__cxa_demangle])])
 
 # Nanosleep requires extra libraries on some architectures (solaris).
 # This sets NANOSLEEP_LIBS.  nanosleep doesn't exist on mingw, which
@@ -479,7 +441,7 @@ fi
 
 STACKTRACE_UNITTEST_LIBS=
 AS_IF([test "x$ac_cv_header_execinfo_h" = xyes],
-  AS_IF([test "x$enable_cpu_profiler" = xyes -o "x$enable_heap_profiler" = xyes -o "x$enable_heap_checker" = xyes],
+  AS_IF([test "x$enable_cpu_profiler" = xyes -o "x$enable_heap_profiler" = xyes],
     [AC_CHECK_DECLS([backtrace_symbols], [], [], [#include <execinfo.h>
                                                   ])
      save_LIBS=$LIBS
@@ -518,7 +480,7 @@ AH_TOP([
 # Also, manually mark systems where we have to be careful how early
 # we run pthreads.  TODO(csilvers): turn this into an autoconf check.
 AH_BOTTOM([
-#ifdef WIN32
+#ifdef _WIN32
 // TODO(csilvers): include windows/port.h in every relevant source file instead?
 #include "windows/port.h"
 #endif
@@ -533,16 +495,14 @@ AM_CONDITIONAL(OSX, expr $host : '.*-apple-darwin.*' >/dev/null 2>&1)
 # they find.
 AM_CONDITIONAL(WITH_CPU_PROFILER, test "$enable_cpu_profiler" = yes)
 AM_CONDITIONAL(WITH_HEAP_PROFILER, test "$enable_heap_profiler" = yes)
-AM_CONDITIONAL(WITH_HEAP_CHECKER, test "$enable_heap_checker" = yes)
 AM_CONDITIONAL(WITH_DEBUGALLOC, test "$enable_debugalloc" = yes)
 # We make tcmalloc.so if either heap-profiler or heap-checker is asked for.
+# TODO/FIXME
 AM_CONDITIONAL(WITH_HEAP_PROFILER_OR_CHECKER,
-               test "$enable_heap_profiler" = yes -o \
-                    "$enable_heap_checker" = yes)
+               test "$enable_heap_profiler" = yes)
 # If we don't use any profilers, we don't need stack traces (or pprof)
 AM_CONDITIONAL(WITH_STACK_TRACE, test "$enable_cpu_profiler" = yes -o \
-                                      "$enable_heap_profiler" = yes -o \
-                                      "$enable_heap_checker" = yes)
+                                      "$enable_heap_profiler" = yes)
 
 have_linux_sigev_thread_id=no
 AC_MSG_CHECKING([for Linux SIGEV_THREAD_ID])
@@ -576,10 +536,21 @@ AS_IF([test "x$enable_aggressive_decommit_by_default" = xyes],
                  1,
                  [enable aggressive decommit by default])])
 
+AC_PATH_PROG(PPROF_PATH, pprof)
+AM_CONDITIONAL(SKIP_PPROF_TESTS, [test "x$PPROF_PATH" = "x"])
+AS_IF([test "x$PPROF_PATH" = "x"],
+      [AC_MSG_WARN([pprof tool not found. Will skip several unit tests that need it. Install via go install github.com/google/pprof@latest then add \$HOME/go/bin to PATH])])
+
+AC_PATH_PROG([ASCIIDOCTOR], [asciidoctor])
+AM_CONDITIONAL([MISSING_ASCIIDOCTOR], [test "x$ASCIIDOCTOR" = "x"])
+AS_IF([test "x$ASCIIDOCTOR" = "x"],
+      [AC_MSG_WARN([asciidoctor tool not found. Will skip building .html documentation from .adoc])])
+AC_ARG_VAR(ASCIIDOCTOR_FLAGS, [flags to pass to asciidoctor])
+
+AM_CONDITIONAL(BUILD_TESTS, test "x$enable_tests" = xyes)
+AS_IF([test "x$enable_tests" != xyes],
+      [AC_MSG_WARN([--disable-tests is passed so tests won't be built and run])])
+
 # Write generated configuration file
-# NOTE: vsprojects/gperftools/tcmalloc.h is checked in
-AC_CONFIG_FILES([Makefile
-                 src/gperftools/tcmalloc.h
-                 vsprojects/include/gperftools/tcmalloc.h:src/gperftools/tcmalloc.h.in
-                 ])
+AC_CONFIG_FILES([Makefile])
 AC_OUTPUT

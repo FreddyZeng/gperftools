@@ -55,11 +55,11 @@
 
 // Annoying stuff for windows -- makes sure clients can import these functions
 #ifndef PERFTOOLS_DLL_DECL
-# ifdef _WIN32
-#   define PERFTOOLS_DLL_DECL  __declspec(dllimport)
-# else
-#   define PERFTOOLS_DLL_DECL
-# endif
+#ifdef _WIN32
+#define PERFTOOLS_DLL_DECL __declspec(dllimport)
+#else
+#define PERFTOOLS_DLL_DECL
+#endif
 #endif
 
 static const int kMallocHistogramSize = 64;
@@ -74,14 +74,13 @@ struct MallocRange;
 // Interface to a pluggable system allocator.
 class PERFTOOLS_DLL_DECL SysAllocator {
  public:
-  SysAllocator() {
-  }
+  SysAllocator() {}
   virtual ~SysAllocator();
 
   // Allocates "size"-byte of memory from system aligned with "alignment".
-  // Returns NULL if failed. Otherwise, the returned pointer p up to and
+  // Returns nullptr if failed. Otherwise, the returned pointer p up to and
   // including (p + actual_size -1) have been allocated.
-  virtual void* Alloc(size_t size, size_t *actual_size, size_t alignment) = 0;
+  virtual void* Alloc(size_t size, size_t* actual_size, size_t alignment) = 0;
 };
 
 // The default implementations of the following routines do nothing.
@@ -99,8 +98,7 @@ class PERFTOOLS_DLL_DECL MallocExtension {
   virtual bool VerifyNewMemory(const void* p);
   virtual bool VerifyArrayNewMemory(const void* p);
   virtual bool VerifyMallocMemory(const void* p);
-  virtual bool MallocMemoryStats(int* blocks, size_t* total,
-                                 int histogram[kMallocHistogramSize]);
+  virtual bool MallocMemoryStats(int* blocks, size_t* total, int histogram[kMallocHistogramSize]);
 
   // Get a human readable description of the following malloc data structures.
   // - Total inuse memory by application.
@@ -143,7 +141,7 @@ class PERFTOOLS_DLL_DECL MallocExtension {
   //
   // This is a best-effort interface useful only for performance
   // analysis.  The implementation may not call func at all.
-  typedef void (RangeFunction)(void*, const base::MallocRange*);
+  typedef void(RangeFunction)(void*, const base::MallocRange*);
   virtual void Ranges(void* arg, RangeFunction func);
 
   // -------------------------------------------------------------------
@@ -229,14 +227,14 @@ class PERFTOOLS_DLL_DECL MallocExtension {
   // Get the named "property"'s value.  Returns true if the property
   // is known.  Returns false if the property is not a valid property
   // name for the current malloc implementation.
-  // REQUIRES: property != NULL; value != NULL
+  // REQUIRES: property != nullptr; value != nullptr
   virtual bool GetNumericProperty(const char* property, size_t* value);
 
   // Set the named "property"'s value.  Returns true if the property
   // is known and writable.  Returns false if the property is not a
   // valid property name for the current malloc implementation, or
   // is not writable.
-  // REQUIRES: property != NULL
+  // REQUIRES: property != nullptr
   virtual bool SetNumericProperty(const char* property, size_t value);
 
   // Mark the current thread as "idle".  This routine may optionally
@@ -259,7 +257,7 @@ class PERFTOOLS_DLL_DECL MallocExtension {
   virtual void MarkThreadBusy();
 
   // Gets the system allocator used by the malloc extension instance. Returns
-  // NULL for malloc implementations that do not support pluggable system
+  // nullptr for malloc implementations that do not support pluggable system
   // allocators.
   virtual SysAllocator* GetSystemAllocator();
 
@@ -277,7 +275,7 @@ class PERFTOOLS_DLL_DECL MallocExtension {
   //
   // It's a no-op for malloc implementations that do not support pluggable
   // system allocators.
-  virtual void SetSystemAllocator(SysAllocator *a);
+  virtual void SetSystemAllocator(SysAllocator* a);
 
   // Try to release num_bytes of free memory back to the operating
   // system for reuse.  Use this extension with caution -- to get this
@@ -314,7 +312,7 @@ class PERFTOOLS_DLL_DECL MallocExtension {
   // p must have been allocated by this malloc implementation,
   // must not be an interior pointer -- that is, must be exactly
   // the pointer returned to by malloc() et al., not some offset
-  // from that -- and should not have been freed yet.  p may be NULL.
+  // from that -- and should not have been freed yet.  p may be nullptr.
   // (Currently only implemented in tcmalloc; other implementations
   // will return 0.)
   // This is equivalent to malloc_size() in OS X, malloc_usable_size()
@@ -323,7 +321,7 @@ class PERFTOOLS_DLL_DECL MallocExtension {
 
   // Returns kOwned if this malloc implementation allocated the memory
   // pointed to by p, or kNotOwned if some other malloc implementation
-  // allocated it or p is NULL.  May also return kUnknownOwnership if
+  // allocated it or p is nullptr.  May also return kUnknownOwnership if
   // the malloc implementation does not keep track of ownership.
   // REQUIRES: p must be a value returned from a previous call to
   // malloc(), calloc(), realloc(), memalign(), posix_memalign(),
@@ -339,7 +337,7 @@ class PERFTOOLS_DLL_DECL MallocExtension {
   };
   virtual Ownership GetOwnership(const void* p);
 
-  // The current malloc implementation.  Always non-NULL.
+  // The current malloc implementation.  Always non-nullptr.
   static MallocExtension* instance();
 
   // DEPRECATED. Internal.
@@ -399,7 +397,7 @@ class PERFTOOLS_DLL_DECL MallocExtension {
   //
   // It is the responsibility of the caller to "delete[]" the returned array.
   //
-  // May return NULL to indicate no results.
+  // May return nullptr to indicate no results.
   //
   // This is an internal extension.  Callers should use the more
   // convenient "GetHeapSample(string*)" method defined above.
@@ -422,17 +420,17 @@ namespace base {
 // Information passed per range.  More fields may be added later.
 struct MallocRange {
   enum Type {
-    INUSE,                // Application is using this range
-    FREE,                 // Range is currently free
-    UNMAPPED,             // Backing physical memory has been returned to the OS
+    INUSE,     // Application is using this range
+    FREE,      // Range is currently free
+    UNMAPPED,  // Backing physical memory has been returned to the OS
     UNKNOWN
     // More enum values may be added in the future
   };
 
-  uintptr_t address;    // Address of range
-  size_t length;        // Byte length of range
-  Type type;            // Type of this range
-  double fraction;      // Fraction of range that is being used (0 if !INUSE)
+  uintptr_t address;  // Address of range
+  size_t length;      // Byte length of range
+  Type type;          // Type of this range
+  double fraction;    // Fraction of range that is being used (0 if !INUSE)
 
   // Perhaps add the following:
   // - stack trace if this range was sampled
@@ -440,6 +438,6 @@ struct MallocRange {
   // - age when allocated (for inuse) or freed (if not in use)
 };
 
-} // namespace base
+}  // namespace base
 
 #endif  // BASE_MALLOC_EXTENSION_H_

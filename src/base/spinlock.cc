@@ -35,7 +35,16 @@
 #include <config.h>
 #include "base/spinlock.h"
 #include "base/spinlock_internal.h"
-#include "base/sysinfo.h"   /* for GetSystemCPUsCount() */
+#include "base/sysinfo.h" /* for GetSystemCPUsCount() */
+
+#if defined(__linux__) && defined(__GNUC__) && (defined(__aarch64__) || defined(__arm64__))
+#include <sys/auxv.h>
+
+#ifndef HWCAP_SB
+#define HWCAP_SB (1 << 29)
+#endif  // HWCAP_SB
+
+#endif
 
 // NOTE on the Lock-state values:
 //
@@ -46,6 +55,11 @@
 static int adaptive_spin_count = 0;
 
 namespace {
+
+#if defined(__GNUC__) && (defined(__aarch64__) || defined(__arm64__))
+bool arm_use_spin_delay_sb;
+#endif
+
 struct SpinLock_InitHelper {
   SpinLock_InitHelper() {
     // On multi-cpu machines, spin for longer before yielding
@@ -53,6 +67,11 @@ struct SpinLock_InitHelper {
     if (GetSystemCPUsCount() > 1) {
       adaptive_spin_count = 1000;
     }
+
+#if defined(__linux__) && defined(__GNUC__) && (defined(__aarch64__) || defined(__arm64__))
+    // Set arm_use_spin_delay_sb variable to "true" to use `sb` if supported
+    if ((getauxval(AT_HWCAP) & HWCAP_SB) != 0) arm_use_spin_delay_sb = true;
+#endif
   }
 };
 
@@ -63,9 +82,14 @@ static SpinLock_InitHelper init_helper;
 
 inline void SpinlockPause(void) {
 #if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
-  __asm__ __volatile__("rep; nop" : : );
-#elif defined(__GNUC__) && defined(__aarch64__)
-  __asm__ __volatile__("isb" : : );
+  __asm__ __volatile__("rep; nop" : :);
+#elif defined(__GNUC__) && (defined(__aarch64__) || defined(__arm64__))
+  // Use SB instruction if available otherwise ISB
+  if (PREDICT_TRUE(arm_use_spin_delay_sb)) {
+    __asm__ __volatile__(".inst 0xd50330ff" : :);  // SB instruction encoding
+  } else {
+    __asm__ __volatile__("isb" : :);
+  }
 #endif
 }
 
@@ -110,8 +134,7 @@ void SpinLock::SlowLock() {
       // current lock owner to think it experienced contention. Note,
       // compare_exchange updates lock_value with previous value of
       // lock word.
-      lockword_.compare_exchange_strong(lock_value, kSpinLockSleeper,
-                                        std::memory_order_acquire);
+      lockword_.compare_exchange_strong(lock_value, kSpinLockSleeper, std::memory_order_acquire);
       if (lock_value == kSpinLockHeld) {
         // Successfully transitioned to kSpinLockSleeper.  Pass
         // kSpinLockSleeper to the SpinLockDelay routine to properly indicate
@@ -127,8 +150,7 @@ void SpinLock::SlowLock() {
     }
 
     // Wait for an OS specific delay.
-    base::internal::SpinLockDelay(&lockword_, lock_value,
-                                  ++lock_wait_call_count);
+    base::internal::SpinLockDelay(&lockword_, lock_value, ++lock_wait_call_count);
     // Spin again after returning from the wait routine to give this thread
     // some chance of obtaining the lock.
     lock_value = SpinLoop();

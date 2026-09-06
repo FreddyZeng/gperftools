@@ -43,55 +43,23 @@
 #include <thread>
 #include <vector>
 
-struct FunctionAndId {
-  void (*ptr_to_function)(int);
-  int id;
-};
-
-#if defined(NO_THREADS)
-
-extern "C" void RunThread(void (*fn)()) {
-  (*fn)();
-}
-
-extern "C" void RunManyThreads(void (*fn)(), int count) {
-  // I guess the best we can do is run fn sequentially, 'count' times
-  for (int i = 0; i < count; i++)
-    (*fn)();
-}
-
-extern "C" void RunManyThreadsWithId(void (*fn)(int), int count) {
-  for (int i = 0; i < count; i++)
-    (*fn)(i);    // stacksize doesn't make sense in a non-threaded context
-}
-
-#else
-
 extern "C" {
-  void RunThread(void (*fn)()) {
-    std::thread{fn}.join();
-  }
+void RunThread(void (*fn)()) { std::thread{fn}.join(); }
 
-  static void RunMany(const std::function<void(int)>& fn, int count) {
-    std::vector<std::thread> threads;
-    threads.reserve(count);
-    for (int i = 0; i < count; i++) {
-      threads.emplace_back(fn, i);
-    }
-    for (auto& t : threads) {
-      t.join();
-    }
+static void RunMany(const std::function<void(int)>& fn, int count) {
+  std::vector<std::thread> threads;
+  threads.reserve(count);
+  for (int i = 0; i < count; i++) {
+    threads.emplace_back(fn, i);
   }
-
-  void RunManyThreads(void (*fn)(), int count) {
-    RunMany([fn] (int dummy) {
-      fn();
-    }, count);
-  }
-
-  void RunManyThreadsWithId(void (*fn)(int), int count) {
-    RunMany(fn, count);
+  for (auto& t : threads) {
+    t.join();
   }
 }
 
-#endif
+void RunManyThreads(void (*fn)(), int count) {
+  RunMany([fn](int dummy) { fn(); }, count);
+}
+
+void RunManyThreadsWithId(void (*fn)(int), int count) { RunMany(fn, count); }
+}

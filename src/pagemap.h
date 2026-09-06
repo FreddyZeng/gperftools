@@ -48,8 +48,8 @@
 
 #include "config.h"
 
-#include <stddef.h>                     // for NULL, size_t
-#include <string.h>                     // for memset
+#include <stddef.h>  // for size_t
+#include <string.h>  // for memset
 #include <stdint.h>
 
 #include "base/basictypes.h"
@@ -78,17 +78,17 @@ class TCMalloc_PageMap1 {
     // that's left is to check for overflow (that is, we don't want to
     // ensure a number y where array_[y] would be an out-of-bounds
     // access).
-    return n <= LENGTH - x;   // an overflow-free way to do "x + n <= LENGTH"
+    return n <= LENGTH - x;  // an overflow-free way to do "x + n <= LENGTH"
   }
 
   void PreallocateMoreMemory() {}
 
-  // Return the current value for KEY.  Returns NULL if not yet set,
-  // or if k is out of range.
+  // Return the current value for KEY.  Returns nullptr if not yet
+  // set, or if k is out of range.
   ALWAYS_INLINE
   void* get(Number k) const {
     if ((k >> BITS) > 0) {
-      return NULL;
+      return nullptr;
     }
     return array_[k];
   }
@@ -97,18 +97,16 @@ class TCMalloc_PageMap1 {
   // REQUIRES "k" has been ensured before.
   //
   // Sets the value 'v' for key 'k'.
-  void set(Number k, void* v) {
-    array_[k] = v;
-  }
+  void set(Number k, void* v) { array_[k] = v; }
 
-  // Return the first non-NULL pointer found in this map for
-  // a page number >= k.  Returns NULL if no such number is found.
+  // Return the first non-nullptr pointer found in this map for a page
+  // number >= k.  Returns nullptr if no such number is found.
   void* Next(Number k) const {
     while (k < (1 << BITS)) {
-      if (array_[k] != NULL) return array_[k];
+      if (array_[k] != nullptr) return array_[k];
       k++;
     }
-    return NULL;
+    return nullptr;
   }
 };
 
@@ -127,8 +125,8 @@ class TCMalloc_PageMap2 {
     void* values[LEAF_LENGTH];
   };
 
-  Leaf* root_[ROOT_LENGTH];             // Pointers to child nodes
-  void* (*allocator_)(size_t);          // Memory allocator
+  Leaf* root_[ROOT_LENGTH];     // Pointers to child nodes
+  void* (*allocator_)(size_t);  // Memory allocator
 
  public:
   typedef uintptr_t Number;
@@ -141,32 +139,31 @@ class TCMalloc_PageMap2 {
   ALWAYS_INLINE
   void* get(Number k) const {
     const Number i1 = k >> LEAF_BITS;
-    const Number i2 = k & (LEAF_LENGTH-1);
-    if ((k >> BITS) > 0 || root_[i1] == NULL) {
-      return NULL;
+    const Number i2 = k & (LEAF_LENGTH - 1);
+    if ((k >> BITS) > 0 || root_[i1] == nullptr) {
+      return nullptr;
     }
     return root_[i1]->values[i2];
   }
 
   void set(Number k, void* v) {
     const Number i1 = k >> LEAF_BITS;
-    const Number i2 = k & (LEAF_LENGTH-1);
+    const Number i2 = k & (LEAF_LENGTH - 1);
     ASSERT(i1 < ROOT_LENGTH);
     root_[i1]->values[i2] = v;
   }
 
   bool Ensure(Number start, size_t n) {
-    for (Number key = start; key <= start + n - 1; ) {
+    for (Number key = start; key <= start + n - 1;) {
       const Number i1 = key >> LEAF_BITS;
 
       // Check for overflow
-      if (i1 >= ROOT_LENGTH)
-        return false;
+      if (i1 >= ROOT_LENGTH) return false;
 
       // Make 2nd level node if necessary
-      if (root_[i1] == NULL) {
+      if (root_[i1] == nullptr) {
         Leaf* leaf = reinterpret_cast<Leaf*>((*allocator_)(sizeof(Leaf)));
-        if (leaf == NULL) return false;
+        if (leaf == nullptr) return false;
         memset(leaf, 0, sizeof(*leaf));
         root_[i1] = leaf;
       }
@@ -188,10 +185,10 @@ class TCMalloc_PageMap2 {
     while (k < (Number(1) << BITS)) {
       const Number i1 = k >> LEAF_BITS;
       Leaf* leaf = root_[i1];
-      if (leaf != NULL) {
+      if (leaf != nullptr) {
         // Scan forward in leaf
         for (Number i2 = k & (LEAF_LENGTH - 1); i2 < LEAF_LENGTH; i2++) {
-          if (leaf->values[i2] != NULL) {
+          if (leaf->values[i2] != nullptr) {
             return leaf->values[i2];
           }
         }
@@ -199,7 +196,7 @@ class TCMalloc_PageMap2 {
       // Skip to next top-level entry
       k = (i1 + 1) << LEAF_BITS;
     }
-    return NULL;
+    return nullptr;
   }
 };
 
@@ -208,11 +205,11 @@ template <int BITS>
 class TCMalloc_PageMap3 {
  private:
   // How many bits should we consume at each interior level
-  static const int INTERIOR_BITS = (BITS + 2) / 3; // Round-up
+  static const int INTERIOR_BITS = (BITS + 2) / 3;  // Round-up
   static const int INTERIOR_LENGTH = 1 << INTERIOR_BITS;
 
   // How many bits should we consume at leaf level
-  static const int LEAF_BITS = BITS - 2*INTERIOR_BITS;
+  static const int LEAF_BITS = BITS - 2 * INTERIOR_BITS;
   static const int LEAF_LENGTH = 1 << LEAF_BITS;
 
   // Interior node
@@ -225,12 +222,12 @@ class TCMalloc_PageMap3 {
     void* values[LEAF_LENGTH];
   };
 
-  Node  root_;                          // Root of radix tree
-  void* (*allocator_)(size_t);          // Memory allocator
+  Node root_;                   // Root of radix tree
+  void* (*allocator_)(size_t);  // Memory allocator
 
   Node* NewNode() {
     Node* result = reinterpret_cast<Node*>((*allocator_)(sizeof(Node)));
-    if (result != NULL) {
+    if (result != nullptr) {
       memset(result, 0, sizeof(*result));
     }
     return result;
@@ -247,11 +244,10 @@ class TCMalloc_PageMap3 {
   ALWAYS_INLINE
   void* get(Number k) const {
     const Number i1 = k >> (LEAF_BITS + INTERIOR_BITS);
-    const Number i2 = (k >> LEAF_BITS) & (INTERIOR_LENGTH-1);
-    const Number i3 = k & (LEAF_LENGTH-1);
-    if ((k >> BITS) > 0 ||
-        root_.ptrs[i1] == NULL || root_.ptrs[i1]->ptrs[i2] == NULL) {
-      return NULL;
+    const Number i2 = (k >> LEAF_BITS) & (INTERIOR_LENGTH - 1);
+    const Number i3 = k & (LEAF_LENGTH - 1);
+    if ((k >> BITS) > 0 || root_.ptrs[i1] == nullptr || root_.ptrs[i1]->ptrs[i2] == nullptr) {
+      return nullptr;
     }
     return reinterpret_cast<Leaf*>(root_.ptrs[i1]->ptrs[i2])->values[i3];
   }
@@ -259,31 +255,30 @@ class TCMalloc_PageMap3 {
   void set(Number k, void* v) {
     ASSERT(k >> BITS == 0);
     const Number i1 = k >> (LEAF_BITS + INTERIOR_BITS);
-    const Number i2 = (k >> LEAF_BITS) & (INTERIOR_LENGTH-1);
-    const Number i3 = k & (LEAF_LENGTH-1);
+    const Number i2 = (k >> LEAF_BITS) & (INTERIOR_LENGTH - 1);
+    const Number i3 = k & (LEAF_LENGTH - 1);
     reinterpret_cast<Leaf*>(root_.ptrs[i1]->ptrs[i2])->values[i3] = v;
   }
 
   bool Ensure(Number start, size_t n) {
-    for (Number key = start; key <= start + n - 1; ) {
+    for (Number key = start; key <= start + n - 1;) {
       const Number i1 = key >> (LEAF_BITS + INTERIOR_BITS);
-      const Number i2 = (key >> LEAF_BITS) & (INTERIOR_LENGTH-1);
+      const Number i2 = (key >> LEAF_BITS) & (INTERIOR_LENGTH - 1);
 
       // Check for overflow
-      if (i1 >= INTERIOR_LENGTH || i2 >= INTERIOR_LENGTH)
-        return false;
+      if (i1 >= INTERIOR_LENGTH || i2 >= INTERIOR_LENGTH) return false;
 
       // Make 2nd level node if necessary
-      if (root_.ptrs[i1] == NULL) {
+      if (root_.ptrs[i1] == nullptr) {
         Node* n = NewNode();
-        if (n == NULL) return false;
+        if (n == nullptr) return false;
         root_.ptrs[i1] = n;
       }
 
       // Make leaf node if necessary
-      if (root_.ptrs[i1]->ptrs[i2] == NULL) {
+      if (root_.ptrs[i1]->ptrs[i2] == nullptr) {
         Leaf* leaf = reinterpret_cast<Leaf*>((*allocator_)(sizeof(Leaf)));
-        if (leaf == NULL) return false;
+        if (leaf == nullptr) return false;
         memset(leaf, 0, sizeof(*leaf));
         root_.ptrs[i1]->ptrs[i2] = reinterpret_cast<Node*>(leaf);
       }
@@ -294,21 +289,20 @@ class TCMalloc_PageMap3 {
     return true;
   }
 
-  void PreallocateMoreMemory() {
-  }
+  void PreallocateMoreMemory() {}
 
   void* Next(Number k) const {
     while (k < (Number(1) << BITS)) {
       const Number i1 = k >> (LEAF_BITS + INTERIOR_BITS);
-      const Number i2 = (k >> LEAF_BITS) & (INTERIOR_LENGTH-1);
-      if (root_.ptrs[i1] == NULL) {
+      const Number i2 = (k >> LEAF_BITS) & (INTERIOR_LENGTH - 1);
+      if (root_.ptrs[i1] == nullptr) {
         // Advance to next top-level entry
         k = (i1 + 1) << (LEAF_BITS + INTERIOR_BITS);
       } else {
         Leaf* leaf = reinterpret_cast<Leaf*>(root_.ptrs[i1]->ptrs[i2]);
-        if (leaf != NULL) {
-          for (Number i3 = (k & (LEAF_LENGTH-1)); i3 < LEAF_LENGTH; i3++) {
-            if (leaf->values[i3] != NULL) {
+        if (leaf != nullptr) {
+          for (Number i3 = (k & (LEAF_LENGTH - 1)); i3 < LEAF_LENGTH; i3++) {
+            if (leaf->values[i3] != nullptr) {
               return leaf->values[i3];
             }
           }
@@ -317,7 +311,7 @@ class TCMalloc_PageMap3 {
         k = ((k >> LEAF_BITS) + 1) << LEAF_BITS;
       }
     }
-    return NULL;
+    return nullptr;
   }
 };
 

@@ -1,0 +1,3 @@
+# Don't pick up anything vendored, we use it from MODULE.bazel
+vendor/googletest
+vendor/aw-backtrace

@@ -37,14 +37,14 @@
 #define TCMALLOC_SPAN_H_
 
 #include <config.h>
+
 #include <set>
+
 #include "common.h"
-#include "base/logging.h"
 #include "page_heap_allocator.h"
 
 namespace tcmalloc {
 
-struct SpanBestFitLess;
 struct Span;
 
 // Store a pointer to a span along with a cached copy of its length.
@@ -58,78 +58,71 @@ struct SpanPtrWithLength {
   Span* span;
   Length length;
 };
-typedef std::set<SpanPtrWithLength, SpanBestFitLess, STLPageHeapAllocator<SpanPtrWithLength, void> > SpanSet;
-
 // Comparator for best-fit search, with address order as a tie-breaker.
 struct SpanBestFitLess {
   bool operator()(SpanPtrWithLength a, SpanPtrWithLength b) const;
 };
 
+using SpanSet = std::set<SpanPtrWithLength, SpanBestFitLess, STLPageHeapAllocator<SpanPtrWithLength, void>>;
+using SpanSetIter = SpanSet::iterator;
+
 // Information kept for a span (a contiguous run of pages).
 struct Span {
-  PageID        start;          // Starting page number
-  Length        length;         // Number of pages in span
-  Span*         next;           // Used when in link list
-  Span*         prev;           // Used when in link list
+  PageID start;   // Starting page number
+  Length length;  // Number of pages in span
+  Span* next;     // Used when in link list
+  Span* prev;     // Used when in link list
   union {
-    void* objects;              // Linked list of free objects
+    void* objects;  // Linked list of free objects
 
     // Span may contain iterator pointing back at SpanSet entry of
     // this span into set of large spans. It is used to quickly delete
     // spans from those sets. span_iter_space is space for such
     // iterator which lifetime is controlled explicitly.
-    char span_iter_space[sizeof(SpanSet::iterator)];
+    alignas(SpanSetIter) char span_iter_space[sizeof(SpanSetIter)];
   };
-  unsigned int  refcount : 16;  // Number of non-free objects
-  unsigned int  sizeclass : 8;  // Size-class for small objects (or 0)
-  unsigned int  location : 2;   // Is the span on a freelist, and if so, which?
-  unsigned int  sample : 1;     // Sampled object?
-  bool          has_span_iter : 1; // Iff span_iter_space has valid
-                                   // iterator. Only for debug builds.
+  unsigned int refcount : 16;  // Number of non-free objects
+  unsigned int sizeclass : 8;  // Size-class for small objects (or 0)
+  unsigned int location : 2;   // Is the span on a freelist, and if so, which?
+  unsigned int sample : 1;     // Sampled object?
+  bool has_span_iter : 1;      // Iff span_iter_space has valid
+                               // iterator. Only for debug builds.
 
   constexpr Span()
-    : start{}, length{}, next{}, prev{}, objects{}, refcount{}, sizeclass{}, location{}, sample{}, has_span_iter{} {}
+      : start{}, length{}, next{}, prev{}, objects{}, refcount{}, sizeclass{}, location{}, sample{}, has_span_iter{} {}
 
   // Sets iterator stored in span_iter_space.
   // Requires has_span_iter == 0.
-  void SetSpanSetIterator(const SpanSet::iterator& iter);
+  void SetSpanSetIterator(const SpanSetIter& iter);
   // Copies out and destroys iterator stored in span_iter_space.
-  SpanSet::iterator ExtractSpanSetIterator();
+  SpanSetIter ExtractSpanSetIterator();
 
   // What freelist the span is on: IN_USE if on none, or normal or returned
   enum { IN_USE, ON_NORMAL_FREELIST, ON_RETURNED_FREELIST };
 };
 
-inline SpanPtrWithLength::SpanPtrWithLength(Span* s)
-    : span(s),
-      length(s->length) {
-}
+inline SpanPtrWithLength::SpanPtrWithLength(Span* s) : span(s), length(s->length) {}
 
 inline bool SpanBestFitLess::operator()(SpanPtrWithLength a, SpanPtrWithLength b) const {
-  if (a.length < b.length)
-    return true;
-  if (a.length > b.length)
-    return false;
+  if (a.length < b.length) return true;
+  if (a.length > b.length) return false;
   return a.span->start < b.span->start;
 }
 
-inline void Span::SetSpanSetIterator(const SpanSet::iterator& iter) {
+inline void Span::SetSpanSetIterator(const SpanSetIter& iter) {
   ASSERT(!has_span_iter);
   has_span_iter = 1;
 
-  new (span_iter_space) SpanSet::iterator(iter);
+  new (span_iter_space) SpanSetIter(iter);
 }
 
-inline SpanSet::iterator Span::ExtractSpanSetIterator() {
-  typedef SpanSet::iterator iterator_type;
-
+inline SpanSetIter Span::ExtractSpanSetIterator() {
   ASSERT(has_span_iter);
   has_span_iter = 0;
 
-  iterator_type* this_iter =
-    reinterpret_cast<iterator_type*>(span_iter_space);
-  iterator_type retval = *this_iter;
-  this_iter->~iterator_type();
+  SpanSetIter* this_iter = reinterpret_cast<SpanSetIter*>(span_iter_space);
+  SpanSetIter retval = *this_iter;
+  this_iter->~SpanSetIter();
   return retval;
 }
 
@@ -144,14 +137,13 @@ void DeleteSpan(Span* span);
 // Initialize *list to an empty list.
 void DLL_Init(Span* list);
 
-// Remove 'span' from the linked list in which it resides, updating the
-// pointers of adjacent Spans and setting span's next and prev to NULL.
+// Remove 'span' from the linked list in which it resides, updating
+// the pointers of adjacent Spans and setting span's next and prev to
+// nullptr.
 void DLL_Remove(Span* span);
 
 // Return true iff "list" is empty.
-inline bool DLL_IsEmpty(const Span* list) {
-  return list->next == list;
-}
+inline bool DLL_IsEmpty(const Span* list) { return list->next == list; }
 
 // Add span to the front of list.
 void DLL_Prepend(Span* list, Span* span);

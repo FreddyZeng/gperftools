@@ -39,7 +39,6 @@
 #include "config.h"
 
 #include <atomic>
-#include <cstddef>
 
 #include "base/basictypes.h"
 #include "base/spinlock.h"
@@ -49,7 +48,6 @@
 #include "page_heap.h"
 #include "page_heap_allocator.h"
 #include "span.h"
-#include "stack_trace_table.h"
 
 namespace tcmalloc {
 
@@ -79,19 +77,15 @@ class Static {
 
   static PageHeapAllocator<Span>* span_allocator() { return &span_allocator_; }
 
-  static PageHeapAllocator<StackTrace>* stacktrace_allocator() {
-    return &stacktrace_allocator_;
-  }
+  static PageHeapAllocator<StackTrace>* stacktrace_allocator() { return &stacktrace_allocator_; }
 
   static StackTrace* growth_stacks() { return growth_stacks_.load(std::memory_order_seq_cst); }
   static void push_growth_stack(StackTrace* s) {
     ASSERT(s->depth <= kMaxStackDepth - 1);
     StackTrace* old_top = growth_stacks_.load(std::memory_order_relaxed);
     do {
-      s->stack[kMaxStackDepth-1] = reinterpret_cast<void*>(old_top);
-    } while (!growth_stacks_.compare_exchange_strong(
-               old_top, s,
-               std::memory_order_seq_cst, std::memory_order_seq_cst));
+      s->stack[kMaxStackDepth - 1] = reinterpret_cast<void*>(old_top);
+    } while (!growth_stacks_.compare_exchange_strong(old_top, s, std::memory_order_seq_cst, std::memory_order_seq_cst));
   }
 
   // State kept for sampled allocations (/pprof/heap support)
@@ -101,26 +95,26 @@ class Static {
   static bool IsInited() { return inited_; }
 
  private:
-  ATTRIBUTE_HIDDEN static bool inited_;
+  ATTRIBUTE_VISIBILITY_HIDDEN static bool inited_;
 
   // These static variables require explicit initialization.  We cannot
   // count on their constructors to do any initialization because other
   // static variables may try to allocate memory before these variables
   // can run their constructors.
 
-  ATTRIBUTE_HIDDEN static SizeMap sizemap_;
-  ATTRIBUTE_HIDDEN static CentralFreeList central_cache_[kClassSizesMax];
-  ATTRIBUTE_HIDDEN static PageHeapAllocator<Span> span_allocator_;
-  ATTRIBUTE_HIDDEN static PageHeapAllocator<StackTrace> stacktrace_allocator_;
-  ATTRIBUTE_HIDDEN static Span sampled_objects_;
+  ATTRIBUTE_VISIBILITY_HIDDEN static SizeMap sizemap_;
+  ATTRIBUTE_VISIBILITY_HIDDEN static CentralFreeList central_cache_[kClassSizesMax];
+  ATTRIBUTE_VISIBILITY_HIDDEN static PageHeapAllocator<Span> span_allocator_;
+  ATTRIBUTE_VISIBILITY_HIDDEN static PageHeapAllocator<StackTrace> stacktrace_allocator_;
+  ATTRIBUTE_VISIBILITY_HIDDEN static Span sampled_objects_;
 
   // Linked list of stack traces recorded every time we allocated memory
   // from the system.  Useful for finding allocation sites that cause
   // increase in the footprint of the system.  The linked list pointer
   // is stored in trace->stack[kMaxStackDepth-1].
-  ATTRIBUTE_HIDDEN static std::atomic<StackTrace*> growth_stacks_;
+  ATTRIBUTE_VISIBILITY_HIDDEN static std::atomic<StackTrace*> growth_stacks_;
 
-  ATTRIBUTE_HIDDEN static StaticStorage<PageHeap> pageheap_;
+  ATTRIBUTE_VISIBILITY_HIDDEN static StaticStorage<PageHeap> pageheap_;
 };
 
 }  // namespace tcmalloc

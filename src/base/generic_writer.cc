@@ -73,7 +73,15 @@ void GenericWriter::AppendMem(const char* str, size_t sz) {
     int amount = static_cast<int>(std::min<size_t>(std::numeric_limits<int>::max(), sz));
     amount = std::min<int>(amount, buf_end_ - buf_fill_);
 
-    memcpy(buf_fill_, str, amount);
+    // So this is silly but ultimately harmless. Glibc defines memcpy
+    // args to be non-null (so, even for the amount == 0 case). And
+    // while in practice it works (and has to), ubsan kinda complains.
+    //
+    // Thankfully in this place we can afford slight perf hit of doing
+    // "stupid" thing.
+    if (PREDICT_TRUE(amount != 0)) {
+      memcpy(buf_fill_, str, amount);
+    }
 
     str += amount;
     buf_fill_ += amount;
@@ -131,9 +139,7 @@ struct ChunkedStorage {
 
   explicit ChunkedStorage(const ChunkedWriterConfig& config) : config(config) {}
 
-  ~ChunkedStorage() {
-    RAW_DCHECK(last_chunk == nullptr, "storage must be released");
-  }
+  ~ChunkedStorage() { RAW_DCHECK(last_chunk == nullptr, "storage must be released"); }
 
   void CloseChunk(int actually_filled) {
     RAW_DCHECK(last_chunk->used == 0, "");
@@ -180,12 +186,11 @@ struct ChunkedStorage {
 };
 
 class ChunkedStorageWriter : public GenericWriter {
-public:
+ public:
   explicit ChunkedStorageWriter(ChunkedStorage* storage) : storage_(storage) {}
-  ~ChunkedStorageWriter() override {
-    FinalRecycle();
-  }
-private:
+  ~ChunkedStorageWriter() override { FinalRecycle(); }
+
+ private:
   std::pair<char*, char*> RecycleBuffer(char* buf_begin, char* buf_end, int want_at_least) override {
     if (storage_->last_chunk != nullptr) {
       storage_->CloseChunk(buf_end - buf_begin);
@@ -201,7 +206,8 @@ private:
 
 }  // namespace
 
-char* DoWithWriterToStrDup(const ChunkedWriterConfig& config, void (*body)(GenericWriter* writer, void* arg), void* arg) {
+char* DoWithWriterToStrDup(const ChunkedWriterConfig& config, void (*body)(GenericWriter* writer, void* arg),
+                           void* arg) {
   ChunkedStorage storage(config);
   {
     ChunkedStorageWriter writer{&storage};
